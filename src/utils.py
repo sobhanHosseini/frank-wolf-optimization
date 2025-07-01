@@ -1,6 +1,15 @@
 import numpy as np
 import pandas as pd
 
+def evaluate(M_true, X_pred, mask):
+    """
+    Compute RMSE on entries where mask is True.
+    """
+    diff = (X_pred - M_true)[mask]
+    if diff.size == 0:
+        return 0.0
+    return np.sqrt(np.mean(diff ** 2))
+
 def load_jester2(path="data/jester2/jester_ratings.dat",
                  test_fraction=0.2, seed=0):
     import numpy as np
