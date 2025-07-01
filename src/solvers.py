@@ -98,6 +98,7 @@ class FrankWolfe:
 
 class PairwiseFrankWolfe(FrankWolfe):
     def run(self, X0=None):
+        print("Running Pairwise Frank-Wolfe...")
         if X0 is not None:
             X = X0.copy()
         else:
