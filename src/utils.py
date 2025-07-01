@@ -38,6 +38,9 @@ def load_jester2(path="data/jester2/jester_ratings.dat",
 
     rng  = np.random.RandomState(seed)
     mask = rng.rand(n_users, n_items) < (1 - test_fraction)
+    mean_rating = M_true[mask].mean()
+    M_true -= mean_rating
+
     M_obs = np.zeros_like(M_true)
     M_obs[mask] = M_true[mask]
 
@@ -59,6 +62,9 @@ def load_movielens100k(path="data/ml-100k/u.data",
 
     rng  = np.random.RandomState(seed)
     mask = rng.rand(n_u, n_i) < (1 - test_fraction)
+    mean_rating = M_true[mask].mean()
+    M_true -= mean_rating
+
     M_obs = np.zeros_like(M_true)
     M_obs[mask] = M_true[mask]
 
@@ -83,6 +89,9 @@ def load_movielens1m(path="data/ml-1m/ratings.dat",
 
     rng  = np.random.RandomState(seed)
     mask = rng.rand(n_users, n_items) < (1 - test_fraction)
+    mean_rating = M_true[mask].mean()
+    M_true -= mean_rating
+
     M_obs = np.zeros_like(M_true)
     M_obs[mask] = M_true[mask]
 
