@@ -18,8 +18,9 @@ class MatrixCompletionObjective:
         self.mask = mask
 
     def value(self, X: np.ndarray) -> float:
-        diff = (X - self.M_obs) * self.mask
-        return 0.5 * np.sum(diff ** 2)
+        # only compute on the observed entries
+        diff = (X - self.M_obs)[self.mask]
+        return 0.5 * np.dot(diff, diff)
 
     def gradient(self, X: np.ndarray) -> np.ndarray:
         grad = np.zeros_like(X)
