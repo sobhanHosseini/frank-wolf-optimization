@@ -148,5 +148,7 @@ class PairwiseFrankWolfe(FrankWolfe):
                 atoms, weights = map(list, zip(*nz))
             else:
                 atoms, weights = [], []
+            print(f"[{t}] gamma: {gamma:.2e}, ||d||_F: {np.linalg.norm(d):.2e}")
+
 
         return X
