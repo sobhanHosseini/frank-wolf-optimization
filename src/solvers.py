@@ -34,16 +34,6 @@ class FrankWolfe:
         return max(raw, 1e-16)
 
     def _choose_step(self, X, grad, S, d, t):
-        """
-        Return step-size alpha in [0,1] for the search direction d = S - X.
-
-        Available self.step_method values:
-            - 'fixed'        : use constant self.fixed_gamma
-            - 'vanilla'      : alpha_k = 2/(t+2)
-            - 'analytic'     : alpha_k = min(max(-<grad,d>/<d,d>_mask, 0), 1)
-            - 'line_search'  : brute-force on a small grid
-            - 'armijo'       : backtracking Armijo rule
-        """
         if self.step_method == 'fixed':
             return float(self.fixed_gamma)
 
@@ -77,7 +67,12 @@ class FrankWolfe:
         return 2.0 / (t + 2)
 
     def run(self, X0=None):
-        X = np.zeros_like(self.obj.M_obs) if X0 is None else X0.copy()
+        if X0 is not None:
+            X = X0.copy()
+        else:
+            grad0 = self.obj.gradient(np.zeros_like(self.obj.M_obs))
+            X = self.lmo(grad0, self.tau)
+
         prev_obj = self.obj.value(X)
 
         for t in trange(self.max_iter, desc='Frank-Wolfe'):
@@ -103,8 +98,13 @@ class FrankWolfe:
 
 class PairwiseFrankWolfe(FrankWolfe):
     def run(self, X0=None):
-        X = np.zeros_like(self.obj.M_obs) if X0 is None else X0.copy()
-        atoms, weights = [], []
+        if X0 is not None:
+            X = X0.copy()
+        else:
+            grad0 = self.obj.gradient(np.zeros_like(self.obj.M_obs))
+            X = self.lmo(grad0, self.tau)
+
+        atoms, weights = [X], [1.0]
 
         for t in trange(self.max_iter, desc='Pairwise-FW'):
             grad = self.obj.gradient(X)
