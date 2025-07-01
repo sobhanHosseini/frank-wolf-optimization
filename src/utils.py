@@ -15,7 +15,7 @@ def load_jester2(path="data/jester2/jester_ratings.dat",
     """
     Load Jester2 dataset and create an 80/20 train/test split.
     """
-    print(f"Loading Jester2 dataset from {path}...:)))))")
+    print(f":!!::)))))")
     user_map = {}
     item_map = {}
     reviews  = []
