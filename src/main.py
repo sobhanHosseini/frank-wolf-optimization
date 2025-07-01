@@ -18,7 +18,6 @@ class MatrixCompletionObjective:
         self.mask = mask
 
     def value(self, X: np.ndarray) -> float:
-        # test
         # only compute on the observed entries
         diff = (X - self.M_obs)[self.mask]
         return 0.5 * np.dot(diff, diff)
