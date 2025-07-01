@@ -34,8 +34,8 @@ def nuclear_norm_lmo(grad: np.ndarray, tau: float) -> np.ndarray:
 
 def main():
     DATASETS = [
-        # ("ml-100k", "../data/ml-100k/u.data"),/
-        # ("jester2", "../data/jester2/jester_ratings.dat"),
+        ("ml-100k", "./data/ml-100k/u.data"),
+        ("jester2", "./data/jester2/jester_ratings.dat"),
         # ("ml-1m",   "../data/ml-1m/ratings.dat"),
     ]
 
@@ -50,7 +50,7 @@ def main():
     results = []
     for name, path in DATASETS:
         print(f"\n=== Dataset: {name} ===")
-        M_obs, mask_train, M_true = load_dataset(
+        M_obs, mask_train, M_true, mean = load_dataset(
             name=name,
             path=path,
             test_fraction=0.2,
@@ -65,7 +65,7 @@ def main():
         t_fw = time.time() - t0
         iters_fw, gaps_fw, vals_fw = zip(*fw.history)
         rmse_fw_train = np.sqrt(2 * obj.value(X_fw) / mask_train.sum())
-        rmse_fw_test = evaluate(M_true, X_fw, ~mask_train)
+        rmse_fw_test = evaluate(M_true + mean, X_fw + mean, ~mask_train)
 
         # Pairwise-FW
         pw = PairwiseFrankWolfe(objective=obj, **common_cfg)
@@ -74,7 +74,7 @@ def main():
         t_pw = time.time() - t0
         iters_pw, gaps_pw, vals_pw = zip(*pw.history)
         rmse_pw_train = np.sqrt(2 * obj.value(X_pw) / mask_train.sum())
-        rmse_pw_test = evaluate(M_true, X_pw, ~mask_train)
+        rmse_pw_test = evaluate(M_true + mean, X_fw + mean, ~mask_train)
 
         # Summary
         print(f" FW      → Train RMSE: {rmse_fw_train:.4f}, Test RMSE: {rmse_fw_test:.4f}, "

@@ -45,7 +45,7 @@ def load_jester2(path="data/jester2/jester_ratings.dat",
     M_obs = np.zeros_like(M_true)
     M_obs[mask] = M_true[mask]
 
-    return M_obs, mask, M_true
+    return M_obs, mask, M_true, mean_rating
 
 def load_movielens100k(path="data/ml-100k/u.data",
                        test_fraction=0.2,
@@ -69,7 +69,7 @@ def load_movielens100k(path="data/ml-100k/u.data",
     M_obs = np.zeros_like(M_true)
     M_obs[mask] = M_true[mask]
 
-    return M_obs, mask, M_true
+    return M_obs, mask, M_true, mean_rating
 
 def load_movielens1m(path="data/ml-1m/ratings.dat",
                      test_fraction=0.2,
@@ -96,7 +96,7 @@ def load_movielens1m(path="data/ml-1m/ratings.dat",
     M_obs = np.zeros_like(M_true)
     M_obs[mask] = M_true[mask]
 
-    return M_obs, mask, M_true
+    return M_obs, mask, M_true, mean_rating
 
 def load_dataset(name, **kwargs):
     """
