@@ -1,35 +1,7 @@
-#!/usr/bin/env python3
-# matrix_completion_fw.py
-
 import numpy as np
 from scipy.sparse.linalg import svds
 from tqdm import trange
-
-
-# === 1) Dataset & Utilities ===
-
-def load_dataset(name="synthetic", test_fraction=0.2, seed=0):
-    """
-    Load or generate a matrix completion dataset.
-    Returns M_obs, mask_train, M_true.
-    """
-    rng = np.random.RandomState(seed)
-    if name == "synthetic":
-        n, m, r = 100, 80, 5
-        U = rng.randn(n, r)
-        V = rng.randn(m, r)
-        M_true = U @ V.T
-    else:
-        data = np.load(name)
-        M_true = data["M"]
-
-    # train/test split
-    mask_train = rng.rand(*M_true.shape) < (1 - test_fraction)
-    M_obs = np.zeros_like(M_true)
-    M_obs[mask_train] = M_true[mask_train]
-
-    return M_obs, mask_train, M_true
-
+from utils import load_dataset
 
 def evaluate(M_true, X_pred, mask):
     """
@@ -168,4 +140,57 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    
+    
+    import time
+    import matplotlib.pyplot as plt
+
+    # 1) Load ML-100K
+    M_obs, mask_train, M_true = load_dataset(
+        name="ml-100k",
+        path="data/ml-100k/u.data",
+        test_fraction=0.2,
+        seed=42
+    )
+
+    # 2) Build objective & solver
+    obj = MatrixCompletionObjective(M_obs, mask_train)
+    solver = FrankWolfe(
+        objective=obj,
+        lmo_fn=nuclear_norm_lmo,
+        tau=10.0,
+        max_iter=200,
+        tol=1e-4,
+        step_method='line_search'
+    )
+
+    # 3) Run & time it
+    start = time.time()
+    X_hat = solver.run()
+    elapsed = time.time() - start
+    print(f"Elapsed: {elapsed:.1f}s")
+
+    # 4) Compute final RMSE
+    rmse_train = np.sqrt(2 * obj.value(X_hat) / mask_train.sum())
+    rmse_test  = evaluate(M_true, X_hat, ~mask_train)
+    print(f"Train RMSE = {rmse_train:.4f}, Test RMSE = {rmse_test:.4f}")
+
+    # 5) Plot duality-gap & train‐RMSE over iterations
+    iters = [t for t, _, _ in solver.history]
+    gaps  = [gap     for _, gap, _ in solver.history]
+    vals  = [val     for _, _, val in solver.history]
+
+    fig, ax1 = plt.subplots(figsize=(6,4))
+    ax1.plot(iters, gaps, 'C0', label='Duality gap')
+    ax1.set_yscale('log')
+    ax1.set_ylabel('Gap', color='C0')
+    ax2 = ax1.twinx()
+    ax2.plot(iters, np.sqrt(2*np.array(vals)/mask_train.sum()), 'C1', label='Train RMSE')
+    ax2.set_ylabel('Train RMSE', color='C1')
+    ax1.set_xlabel('Iteration')
+    ax1.set_title('ML-100K: FW Convergence')
+    ax1.legend(loc='upper right')
+    ax2.legend(loc='lower right')
+    plt.tight_layout()
+    plt.show()
+
