@@ -1,4 +1,6 @@
-import logging, time
+# main.py
+import os
+import time
 import numpy as np
 import matplotlib.pyplot as plt
 
@@ -11,198 +13,290 @@ from solvers import (
 )
 
 # ----------------------------------------------------------------------------
-# Logging config
-# ----------------------------------------------------------------------------
-logging.basicConfig(level=logging.INFO,
-                    format="%(asctime)s %(levelname)s: %(message)s",
-                    datefmt="%Y-%m-%d %H:%M:%S")
-
-# ----------------------------------------------------------------------------
-# Experiment config
+# Configuration: datasets and step rules
 # ----------------------------------------------------------------------------
 config = {
-    'dataset':       'ml-100k',
+    'datasets':      ['ml-100k', 'jester2'],  # multiple datasets
+    'steps':         [ 'analytic'],  # FW/PFW step rules
     'test_fraction': 0.2,
     'seed':          42,
     'tau_scale':     1.0,
-    'max_iter':      100,
+    'max_iter':      30,
     'tol':           1e-6,
     'tol_obj':       1e-8,
     'patience':      10,
+    'save_plots':    False,
+    'plot_dir':      'plots',
 }
-STEP_METHODS = ['analytic']
+if config['save_plots']:
+    os.makedirs(config['plot_dir'], exist_ok=True)
 
 # ----------------------------------------------------------------------------
-# Load data
+# Utility: subsample indices for plotting
 # ----------------------------------------------------------------------------
-logging.info(f"Loading {config['dataset']}")
-M_obs, mask_train, M_true = load_dataset(
-    name=config['dataset'],
-    test_fraction=config['test_fraction'],
-    seed=config['seed']
-)
-obj = MatrixCompletionObjective(M_obs, mask_train)
-tau = config['tau_scale'] * np.linalg.norm(M_true, ord='nuc')
-logging.info(f"tau = {tau:.3f}")
+def subsample_indices(n, num=20):
+    if n <= num:
+        return np.arange(n)
+    return np.unique(np.linspace(0, n - 1, num, dtype=int))
 
 # ----------------------------------------------------------------------------
-# Run experiments
+# Experiment runner: executes FW and PFW, collects metrics and summary rows
 # ----------------------------------------------------------------------------
-results = {}
-solver_objs = {}
-for name, Solver in [('FW', FrankWolfe), ('PFW', PairwiseFrankWolfe)]:
-    results[name] = {}
-    solver_objs[name] = {}
-    for step in STEP_METHODS:
-        logging.info(f"→ {name} with step={step}")
-        solver = Solver(
-            objective=obj,
-            lmo_fn=nuclear_norm_lmo,
-            tau=tau,
-            max_iter=config['max_iter'],
-            tol=config['tol'],
-            step_method=step,
-            tol_obj=config['tol_obj'],
-            patience=config['patience']
-        )
-        t0 = time.time()
-        Xf = solver.run()
-        dt = time.time() - t0
-        logging.info(f"   done in {dt:.2f}s, iters={len(solver.history)}")
+class ExperimentRunner:
+    def __init__(self, cfg):
+        self.cfg = cfg
+        self.results = {}       # results[dataset][solver][step]
+        self.solver_objs = {}   # solver objects per dataset
+        self.summary_rows = []  # (dataset, solver-step, rmse_tr, rmse_te, nrmse_tr, nrmse_te, r2_tr, r2_te, iters)
 
-        # collect histories
-        n = len(solver.history)
-        if n == 0:
-            continue
-        iters    = np.array([h[0] for h in solver.history])
-        gaps     = np.array([h[1] for h in solver.history])
-        objs     = np.array([h[2] for h in solver.history])
-        rmse_tr  = np.sqrt(2*objs / mask_train.sum())
-        # align test rmse with history length
-        snapshots = solver.snapshots[:n]
-        rmse_te  = np.array([evaluate(M_true, Xk, ~mask_train)
-                             for Xk in snapshots])
-        # align times with history length
-        times    = np.array(solver.times)
-        times    = times[1:n+1] if len(times) >= n+1 else times[:n]
+    def run(self):
+        for dataset in self.cfg['datasets']:
+            print(f"\n=== Dataset: {dataset} ===")
+            M_obs, mask_train, M_true = load_dataset(
+                name=dataset,
+                test_fraction=self.cfg['test_fraction'],
+                seed=self.cfg['seed']
+            )
+            # Precompute rating range and SST for summary
+            if dataset == 'jester2':
+                rmin, rmax = -10.0, 10.0
+            elif dataset in ('ml-100k', 'ml-1m'):
+                rmin, rmax = 1.0, 5.0
+            else:
+                vals = M_true[mask_train]
+                rmin, rmax = float(vals.min()), float(vals.max())
+            rating_range = rmax - rmin
+            y_tr = M_true[mask_train]
+            y_te = M_true[~mask_train]
+            mu_tr = y_tr.mean(); mu_te = y_te.mean()
+            SST_tr = ((y_tr - mu_tr)**2).sum()
+            SST_te = ((y_te - mu_te)**2).sum()
 
-        results[name][step] = {
-            'iters': iters,
-            'gap': gaps,
-            'obj_vals': objs,
-            'rmse_train': rmse_tr,
-            'rmse_test': rmse_te,
-            'times': times,
-            'step_history': np.array(solver.step_history),
-            'active_sizes': np.array([
-                len(w) for w in getattr(solver, 'weights_history', [])
-            ])[:n]
-        }
-        solver_objs[name][step] = solver
+            # Setup objective and tau
+            obj = MatrixCompletionObjective(M_obs, mask_train)
+            def_tau = np.linalg.norm(M_true, ord='nuc')
+            tau     = self.cfg['tau_scale'] * def_tau
+            print(f"Using tau = {tau:.3f} (||M_true||_* = {def_tau:.3f})")
 
-# ----------------------------------------------------------------------------
-# Plot 1: Dual gap vs iteration
-# ----------------------------------------------------------------------------
-plt.figure(figsize=(6,4))
-for name, data_dict in results.items():
-    for step, data in data_dict.items():
-        g = np.maximum(data['gap'],1e-16)
-        plt.loglog(data['iters'], g, label=f"{name}-{step}")
-plt.xlabel("Iteration")
-plt.ylabel("Duality Gap")
-plt.title("Duality Gap vs Iteration")
-plt.legend()
-plt.grid(True, which='both')
-plt.tight_layout()
+            ds_results = {}
+            ds_solvers = {}
+            for solver_name, Solver in [('FW', FrankWolfe), ('PFW', PairwiseFrankWolfe)]:
+                solver_map = {}
+                for step in self.cfg['steps']:
+                    print(f"--- {solver_name} with step='{step}' ---")
+                    solver = Solver(
+                        objective=obj,
+                        lmo_fn=nuclear_norm_lmo,
+                        tau=tau,
+                        max_iter=self.cfg['max_iter'],
+                        tol=self.cfg['tol'],
+                        step_method=step,
+                        tol_obj=self.cfg['tol_obj'],
+                        patience=self.cfg['patience']
+                    )
+                    start = time.time()
+                    solver.run()
+                    duration = time.time() - start
+                    iters = len(solver.history)
+                    print(f"Finished in {duration:.2f}s, iterations = {iters}")
+                    if iters == 0:
+                        continue
 
-# ----------------------------------------------------------------------------
-# Plot 2: Objective value vs time
-# ----------------------------------------------------------------------------
-plt.figure(figsize=(6,4))
-for name, data_dict in results.items():
-    for step, data in data_dict.items():
-        plt.plot(data['times'], data['obj_vals'], label=f"{name}-{step}")
-plt.xlabel("Time (s)")
-plt.ylabel("Objective value")
-plt.title("Objective vs Wall-clock Time")
-plt.legend()
-plt.grid(True)
-plt.tight_layout()
+                    # Collect time series metrics
+                    it_arr     = np.array([h[0] for h in solver.history])
+                    gaps       = np.array([h[1] for h in solver.history])
+                    obj_vals   = np.array([h[2] for h in solver.history])
+                    rmse_tr    = np.sqrt(2 * obj_vals / mask_train.sum())
+                    snaps      = solver.snapshots[:iters]
+                    rmse_te    = np.array([evaluate(M_true, Xk, ~mask_train) for Xk in snaps])
+                    times      = np.array(solver.times)[1:iters+1]
+                    steps_hist = np.array(solver.step_history)
+                    weights_hist = getattr(solver, 'weights_history', None)
+                    if weights_hist is None:
+                        active_sz = np.zeros(iters, dtype=int)
+                    else:
+                        active_sz = np.array([len(w) for w in weights_hist])[:iters]
 
-# ----------------------------------------------------------------------------
-# Plot 3: RMSE train/test vs iteration
-# ----------------------------------------------------------------------------
-plt.figure(figsize=(6,4))
-for name, data_dict in results.items():
-    for step, data in data_dict.items():
-        it = data['iters']
-        plt.plot(it, data['rmse_train'], '--', label=f"{name}-{step}-train")
-        plt.plot(it, data['rmse_test'],  '-', label=f"{name}-{step}-test")
-plt.xlabel("Iteration")
-plt.ylabel("RMSE")
-plt.title("Train/Test RMSE vs Iteration")
-plt.legend()
-plt.grid(True)
-plt.tight_layout()
+                    solver_map[step] = {
+                        'iters': it_arr,
+                        'gap': gaps,
+                        'obj_vals': obj_vals,
+                        'rmse_train': rmse_tr,
+                        'rmse_test': rmse_te,
+                        'times': times,
+                        'step_history': steps_hist,
+                        'active_sizes': active_sz,
+                    }
+                    # Summary row
+                    final_tr = rmse_tr[-1]
+                    final_te = rmse_te[-1]
+                    nrm_tr = final_tr / rating_range
+                    nrm_te = final_te / rating_range
+                    Xf = solver.snapshots[-1]
+                    SSE_tr = ((Xf[mask_train] - y_tr)**2).sum()
+                    SSE_te = ((Xf[~mask_train] - y_te)**2).sum()
+                    R2_tr = 1 - SSE_tr / SST_tr if SST_tr > 0 else np.nan
+                    R2_te = 1 - SSE_te / SST_te if SST_te > 0 else np.nan
+                    self.summary_rows.append(
+                        (dataset, f"{solver_name}-{step}", final_tr, final_te,
+                         nrm_tr, nrm_te, R2_tr, R2_te, iters)
+                    )
+                ds_results[solver_name] = solver_map
+                ds_solvers[solver_name] = solver
 
-# ----------------------------------------------------------------------------
-# Plot 4: Active-set size vs iteration (PFW only)
-# ----------------------------------------------------------------------------
-plt.figure(figsize=(6,3))
-for step, data in results.get('PFW', {}).items():
-    plt.plot(data['iters'], data['active_sizes'], '-o', label=step)
-plt.xlabel("Iteration")
-plt.ylabel("Active-set size")
-plt.title("PFW Active-set Growth")
-plt.legend()
-plt.grid(True)
-plt.tight_layout()
+            self.results[dataset]     = ds_results
+            self.solver_objs[dataset] = ds_solvers
+        return self.results, self.solver_objs, self.summary_rows
 
 # ----------------------------------------------------------------------------
-# Plot 5: Step-size vs iteration
+# Plotter: visualizes results and prints tables
 # ----------------------------------------------------------------------------
-plt.figure(figsize=(6,4))
-for name, data_dict in results.items():
-    for step, data in data_dict.items():
-        steps = data.get('step_history', [])
-        if len(steps) == 0:
-            continue
-        its = np.arange(len(steps))
-        plt.plot(its, steps, label=f"{name}-{step}")
-plt.xlabel("Iteration")
-plt.ylabel("Step-size γₖ")
-plt.yscale('log')
-plt.title("Step-size vs Iteration")
-plt.legend()
-plt.grid(True)
-plt.tight_layout()
+class ExperimentPlotter:
+    def __init__(self, results, solver_objs, summary_rows, cfg):
+        self.results      = results
+        self.solver_objs  = solver_objs
+        self.summary_rows = summary_rows
+        self.cfg          = cfg
+
+    def plot(self):
+        # Per-dataset plots and tables
+        for dataset in self.cfg['datasets']:
+            print(f"\n=== Results for {dataset} ===")
+            data    = self.results[dataset]
+            sol_map = self.solver_objs[dataset]
+            # 2x3 diagnostic plots
+            fig, axes = plt.subplots(2,3,figsize=(18,10))
+            ax1,ax2,ax3,ax4,ax5,ax6 = axes.flatten()
+            for ax in axes.flatten(): ax.set_axisbelow(True)
+                        # 1) Duality gap vs iteration
+            for sname, dd in data.items():
+                for step, d in dd.items():
+                    idx = subsample_indices(len(d['iters']))
+                    ax1.loglog(
+                        d['iters'][idx],
+                        np.maximum(d['gap'][idx], 1e-16),
+                        label=f"{sname}-{step}"
+                    )
+            ax1.set(title='Gap vs Iter', xlabel='Iteration', ylabel='Duality Gap')
+            ax1.legend(); ax1.grid(True, which='both')
+
+            # 2) Objective vs time
+            for sname, dd in data.items():
+                for step, d in dd.items():
+                    idx = subsample_indices(len(d['times']))
+                    ax2.plot(
+                        d['times'][idx],
+                        d['obj_vals'][idx],
+                        label=f"{sname}-{step}"
+                    )
+            ax2.set(title='Obj vs Time', xlabel='Time (s)', ylabel='Objective')
+            ax2.legend(); ax2.grid(True)
+
+            # 3) RMSE train/test vs iteration
+            for sname, dd in data.items():
+                for step, d in dd.items():
+                    idx = subsample_indices(len(d['iters']))
+                    ax3.plot(
+                        d['iters'][idx],
+                        d['rmse_train'][idx],
+                        '--',
+                        label=f"{sname}-{step}-train"
+                    )
+                    ax3.plot(
+                        d['iters'][idx],
+                        d['rmse_test'][idx],
+                        '-',
+                        label=f"{sname}-{step}-test"
+                    )
+            ax3.set(title='RMSE vs Iter', xlabel='Iteration', ylabel='RMSE')
+            ax3.legend(); ax3.grid(True)
+
+            # 4) Active-set size (PFW)
+            if 'PFW' in data:
+                for step, d in data['PFW'].items():
+                    idx = subsample_indices(len(d['active_sizes']))
+                    ax4.plot(
+                        d['iters'][idx],
+                        d['active_sizes'][idx],
+                        '-o',
+                        label=step
+                    )
+            ax4.set(title='PFW Active-set Growth', xlabel='Iteration', ylabel='Active-set size')
+            ax4.legend(); ax4.grid(True)
+
+            # 5) Step-size vs iteration
+            for sname, dd in data.items():
+                for step, d in dd.items():
+                    st = d['step_history']
+                    if len(st) == 0:
+                        continue
+                    idx = subsample_indices(len(st))
+                    ax5.plot(idx, st[idx], 'o-', label=f"{sname}-{step}")
+            ax5.set(title='Step-size vs Iter', xlabel='Iteration', ylabel='Step-size γ_k')
+            ax5.set_yscale('log'); ax5.legend(); ax5.grid(True)
+
+            # 6) Train RMSE vs estimated rank
+            for sname, solver in sol_map.items():
+                ranks = [
+                    np.linalg.matrix_rank(Xk, tol=1e-3)
+                    for Xk in solver.snapshots[:len(solver.history)]
+                ]
+                idx = subsample_indices(len(ranks))
+                ax6.plot(
+                    np.array(ranks)[idx],
+                    data[sname]['analytic']['rmse_train'][idx],
+                    '-o',
+                    label=sname
+                )
+            ax6.set(title='Train RMSE vs Rank', xlabel='Rank', ylabel='Train RMSE')
+            ax6.legend(); ax6.grid(True)
+            plt.tight_layout(); plt.suptitle(f"Diagnostics {dataset}", y=1.02)
+            if self.cfg['save_plots']:
+                fig.savefig(os.path.join(self.cfg['plot_dir'], f"{dataset}_diagnostics.png"))
+            plt.show()
+
+            # Summary table per dataset
+            rows = [r for r in self.summary_rows if r[0]==dataset]
+            hdr = f"{'Dataset':10s}{'Solver-Step':20s}{'RMSE_tr':>8s}{'RMSE_te':>8s}{'NRMSE_tr':>8s}{'NRMSE_te':>8s}{'R2_tr':>8s}{'R2_te':>8s}{'Iters':>6s}"
+            print(hdr)
+            print('-'*len(hdr))
+            for ds, solstep, tr, te, ntr, nte, r2t, r2e, it in rows:
+                print(f"{ds:10s}{solstep:20s}{tr:8.4f}{te:8.4f}{ntr:8.4f}{nte:8.4f}{r2t:8.4f}{r2e:8.4f}{it:6d}")
+
+        # Combined table across all datasets
+        if len(self.cfg['datasets'])>1:
+            print("\n=== Combined Summary ===")
+            hdr = f"{'Dataset':10s}{'Solver-Step':20s}{'RMSE_tr':>8s}{'RMSE_te':>8s}{'NRMSE_tr':>8s}{'NRMSE_te':>8s}{'R2_tr':>8s}{'R2_te':>8s}{'Iters':>6s}"
+            print(hdr)
+            print('-'*len(hdr))
+            for ds, solstep, tr, te, ntr, nte, r2t, r2e, it in self.summary_rows:
+                print(f"{ds:10s}{solstep:20s}{tr:8.4f}{te:8.4f}{ntr:8.4f}{nte:8.4f}{r2t:8.4f}{r2e:8.4f}{it:6d}")
+
+        # Cross-dataset NRMSE plot
+        if len(self.cfg['datasets'])>1:
+            ds_list = self.cfg['datasets']
+            x = np.arange(len(ds_list))
+            fig, ax = plt.subplots(figsize=(6,4))
+            for solver_name in ['FW','PFW']:
+                for step in self.cfg['steps']:
+                    y = []
+                    for ds in ds_list:
+                        d = self.results[ds][solver_name][step]
+                        y.append(d['rmse_test'][-1] / (20 if ds=='jester2' else 4))
+                    ax.plot(x, y, '-o', label=f"{solver_name}-{step}")
+            ax.set_xticks(x); ax.set_xticklabels(ds_list)
+            ax.set(title='Test NRMSE Across Datasets', xlabel='Dataset', ylabel='Test NRMSE')
+            ax.legend(); ax.grid(True)
+            plt.tight_layout()
+            if self.cfg['save_plots']:
+                fig.savefig(os.path.join(self.cfg['plot_dir'], "cross_dataset_nrmse.png"))
+            plt.show()
 
 # ----------------------------------------------------------------------------
-# Plot 6: RMSE vs estimated rank
+# Main execution
 # ----------------------------------------------------------------------------
-plt.figure(figsize=(6,4))
-for name, solvers_map in solver_objs.items():
-    for step, solver in solvers_map.items():
-        ranks = [np.linalg.matrix_rank(Xk, tol=1e-3) for Xk in solver.snapshots[:len(solver.history)]]
-        plt.plot(ranks, results[name][step]['rmse_train'], '-o', label=f"{name}-{step}")
-plt.xlabel("Estimated Rank")
-plt.ylabel("Train RMSE")
-plt.title("Train RMSE vs Estimated Rank")
-plt.legend()
-plt.grid(True)
-plt.tight_layout()
-
-plt.show()
-
-# ----------------------------------------------------------------------------
-# Summary table
-# ----------------------------------------------------------------------------
-print("\nFinal Metrics:")
-print(f"{'Solver-Step':20s} {'Train RMSE':>10s} {'Test RMSE':>10s} {'Iters':>6s} {'Time(s)':>8s}")
-for name, data_dict in results.items():
-    for step, data in data_dict.items():
-        trm = data['rmse_train'][-1]
-        trem= data['rmse_test'][-1]
-        it  = len(data['iters'])
-        ti  = data['times'][-1] if len(data['times'])>0 else 0.0
-        print(f"{name+'-'+step:20s} {trm:10.4f} {trem:10.4f} {it:6d} {ti:8.2f}")
+if __name__ == '__main__':
+    runner = ExperimentRunner(config)
+    results, solver_objs, summary_rows = runner.run()
+    plotter = ExperimentPlotter(results, solver_objs, summary_rows, config)
+    plotter.plot()
