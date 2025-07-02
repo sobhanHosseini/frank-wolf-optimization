@@ -10,7 +10,7 @@ def evaluate(M_true, X_pred, mask):
         return 0.0
     return np.sqrt(np.mean(diff ** 2))
 
-def load_jester2(path="data/jester2/jester_ratings.dat",
+def load_jester2(path="../data/jester2/jester_ratings.dat",
                  test_fraction=0.2, seed=0):
     import numpy as np
 
@@ -46,7 +46,7 @@ def load_jester2(path="data/jester2/jester_ratings.dat",
     return M_obs, mask, M_true
 
 
-def load_movielens100k(path="data/ml-100k/u.data",
+def load_movielens100k(path="../data/ml-100k/u.data",
                        test_fraction=0.2,
                        seed=0):
     """
@@ -72,7 +72,7 @@ def load_movielens100k(path="data/ml-100k/u.data",
 
 
 def load_movielens1m(
-    path="data/ml-1m/ratings.dat",
+    path="../data/ml-1m/ratings.dat",
     test_fraction=0.2,
     seed=0
 ):
