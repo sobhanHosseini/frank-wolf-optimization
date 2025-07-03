@@ -1,7 +1,73 @@
 import numpy as np
 from scipy.sparse.linalg import svds
 from tqdm import trange
+import time
 
+# ----------------------------------------------------------------
+# Problem definition and LMO
+# ----------------------------------------------------------------
+class MatrixCompletionObjective:
+    def __init__(self, M_obs: np.ndarray, mask: np.ndarray):
+        """
+        Half squared error on observed entries.
+        M_obs : observed entries (zeros elsewhere)
+        mask  : boolean mask of observed entries
+        """
+        self.M_obs = M_obs
+        self.mask  = mask
+
+    def value(self, X: np.ndarray) -> float:
+        diff = (X - self.M_obs)[self.mask]
+        return 0.5 * float(np.dot(diff, diff))
+
+    def gradient(self, X: np.ndarray) -> np.ndarray:
+        grad = np.zeros_like(X)
+        grad[self.mask] = (X - self.M_obs)[self.mask]
+        return grad
+
+# ----------------------------------------------------------------
+# Linear Minimization Oracle (nuclear-norm ball)
+# ----------------------------------------------------------------
+def nuclear_norm_lmo(grad: np.ndarray, tau: float):
+    """
+    Returns S = -tau * u1 v1^T solving min ⟨grad, Z⟩ s.t. ||Z||_* ≤ tau.
+    Note: negative ensures descent direction.
+    """
+    try:
+        u, s, vt = svds(grad, k=1, tol=1e-3, maxiter=200)
+        if s[0] < 0:
+            raise RuntimeError("Non-positive singular value")
+    except Exception:
+        U, S, VT = np.linalg.svd(grad, full_matrices=False)
+        u, vt    = U[:, :1], VT[:1, :]
+    return Atom(u, vt, tau)
+
+# ----------------------------------------------------------------
+# Rank-1 Atom container
+# ----------------------------------------------------------------
+class Atom:
+    def __init__(self, u: np.ndarray, v: np.ndarray, tau: float):
+        self.u   = u.reshape(-1,1)
+        self.v   = v.reshape(1,-1)
+        self.tau = tau
+
+    def to_matrix(self) -> np.ndarray:
+        # Return -tau * u v^T to align with descent direction
+        return -self.tau * (self.u @ self.v)
+
+    def __eq__(self, other):
+        return (
+            isinstance(other, Atom) and
+            np.allclose(self.u, other.u) and
+            np.allclose(self.v, other.v)
+        )
+
+    def __repr__(self):
+        return f"Atom(tau={self.tau}, u_shape={self.u.shape}, v_shape={self.v.shape})"
+
+# ----------------------------------------------------------------
+# Frank–Wolfe solver with logging
+# ----------------------------------------------------------------
 class FrankWolfe:
     def __init__(
         self,
@@ -11,139 +77,134 @@ class FrankWolfe:
         max_iter: int = 50,
         tol: float = 1e-4,
         step_method: str = 'vanilla',
-        fixed_gamma: float = 0.1
+        fixed_gamma: float = 0.1,
+        tol_obj: float = 1e-6,
+        patience: int = 10
     ):
-        """
-        Frank–Wolfe solver for convex objectives over nuclear-norm ball.
-        """
-        self.obj = objective
-        self.lmo = lmo_fn
-        self.tau = tau
-        self.max_iter = max_iter
-        self.tol = tol
-        self.step_method = step_method
-        self.fixed_gamma = fixed_gamma
-        self.history = []
+        # problem
+        self.obj          = objective
+        self.lmo          = lmo_fn
+        self.tau          = tau
+        self.max_iter     = max_iter
+        self.tol          = tol
+        self.step_method  = step_method
+        self.fixed_gamma  = fixed_gamma
+        self.tol_obj      = tol_obj
+        self.patience     = patience
+        # logging and histories
+        self.history      = []  # (iter, gap, obj)
+        self.times        = []  # wall-clock times
+        self.snapshots    = []  # X iterates
+        self.step_history = []  # gamma iterates
 
     def _dual_gap(self, X, grad, S):
-        raw = -np.sum((X - S) * grad)    # <-- note the leading minus
-        return max(raw, 1e-16)
+        raw = -np.sum((S - X) * grad)
+        return float(max(raw, 0.0))
 
-    
     def _choose_step(self, X, grad, S, d, t):
-        """
-        Return step-size alpha in [0,1] for the search direction d = S - X.
-
-        Available self.step_method values:
-            - 'fixed'        : use constant self.fixed_gamma
-            - 'vanilla'      : alpha_k = 2/(t+2)
-            - 'analytic'     : alpha_k = min(max(-<grad,d>/<d,d>_mask, 0), 1)
-            - 'line_search'  : brute-force on a small grid
-            - 'armijo'       : backtracking Armijo rule
-        """
-
-        # 1) Fixed constant gamma
         if self.step_method == 'fixed':
             return float(self.fixed_gamma)
-
-        # 2) Classical diminishing FW
         if self.step_method == 'vanilla':
             return 2.0 / (t + 2)
-
-        # 3) Analytic / Lipschitz-quadratic model step
         if self.step_method == 'analytic':
             num = float(np.sum(grad * d))
-            den = float(np.sum((d * self.obj.mask)**2))  # squared masked norm
+            den = float(np.sum((d * self.obj.mask)**2))
             if den <= 0:
-                # no local curvature → fall back to vanilla
                 return 2.0 / (t + 2)
-            alpha = -num / den
-            return float(np.clip(alpha, 0.0, 1.0))
-
-        # 4) Exact line-search on a fixed grid
+            return float(np.clip(-num/den, 0.0, 1.0))
         if self.step_method == 'line_search':
             alphas = np.linspace(0.0, 1.0, 20)
-            vals   = [self.obj.value(X + a * d) for a in alphas]
-            
+            vals   = [self.obj.value(X + a*d) for a in alphas]
             return float(alphas[np.argmin(vals)])
-
-        # 5) Armijo / backtracking rule
         if self.step_method == 'armijo':
-            # delta in (0,1), beta in (0,1) controls sufficient-decrease
             delta, beta = 0.5, 0.1
             fk = self.obj.value(X)
             gd = float(np.sum(grad * d))
             alpha = 1.0
-            # Shrink until we satisfy f(X+alpha d) <= f(X) + beta * alpha * <grad,d>
             while alpha > 1e-8:
-                if self.obj.value(X + alpha * d) <= fk + beta * alpha * gd:
+                if self.obj.value(X + alpha*d) <= fk + beta*alpha*gd:
                     return alpha
                 alpha *= delta
             return 0.0
-
-        # Fallback to vanilla if method name is unrecognized
-        return 2.0 / (t + 2)
+        return 2.0/(t+2)
 
     def run(self, X0=None):
         X = np.zeros_like(self.obj.M_obs) if X0 is None else X0.copy()
+        self.snapshots.append(X.copy())
+        t0 = time.perf_counter()
+        self.times.append(0.0)
+
+        best_obj, no_imp = float('inf'), 0
         for t in trange(self.max_iter, desc='Frank-Wolfe'):
-            grad = self.obj.gradient(X)
-            S = self.lmo(grad, self.tau)
-            d = S - X
-            gap = self._dual_gap(X, grad, S)
-            self.history.append((t, gap, self.obj.value(X)))
-            if gap < self.tol:
-                break
+            grad    = self.obj.gradient(X)
+            atom    = self.lmo(grad, self.tau)
+            S       = atom.to_matrix()
+            d       = S - X
+            gap     = self._dual_gap(X, grad, S)
+            obj_val = self.obj.value(X)
+            self.history.append((t, gap, obj_val))
+            if gap < self.tol: break
+            if obj_val < best_obj - self.tol_obj:
+                best_obj, no_imp = obj_val, 0
+            else:
+                no_imp += 1
+                if no_imp >= self.patience: break
             gamma = self._choose_step(X, grad, S, d, t)
-            X += gamma * d
+            X    += gamma * d
+            self.step_history.append(gamma)
+            self.snapshots.append(X.copy())
+            self.times.append(time.perf_counter() - t0)
         return X
 
-
+# ----------------------------------------------------------------
+# Pairwise Frank–Wolfe with logging
+# ----------------------------------------------------------------
 class PairwiseFrankWolfe(FrankWolfe):
     def run(self, X0=None):
-        # 0) Initialization
         X = np.zeros_like(self.obj.M_obs) if X0 is None else X0.copy()
+        self.snapshots    = [X.copy()]
+        t0 = time.perf_counter()
+        self.times        = [0.0]
+        self.history      = []
+        self.step_history = []
+        self.weights_history = []
+
         atoms, weights = [], []
-
+        best_obj, no_imp = float('inf'), 0
         for t in trange(self.max_iter, desc='Pairwise-FW'):
-            # 1) Compute gradient and LMO
             grad = self.obj.gradient(X)
-            S    = self.lmo(grad, self.tau)
-
-            # 2) Ensure S in active set
-            if S not in atoms:
-                atoms.append(S);  weights.append(0.0)
-            idx_S = atoms.index(S)
-
-            # 3) Away atom selection
-            scores   = [np.sum(grad * A) for A in atoms]
-            idx_max  = int(np.argmax(scores))
-            V        = atoms[idx_max]
-            alpha_max= weights[idx_max]
-
-            # 4) Pairwise direction & dual gap
-            d   = S - V
-            gap = self._dual_gap(X, grad, S)
-            self.history.append((t, gap, self.obj.value(X)))
-            if gap < self.tol:
-                break
-
-            # 5) Choose step‐size (capped by alpha_max)
-            gamma = min(self._choose_step(X, grad, S, d, t), alpha_max)
-
-            # 6) In‐place update of X
-            X += gamma * d    # <-- just add gamma*(S - V)
-
-            # 7) Update weights
-            weights[idx_S]   += gamma
-            weights[idx_max] -= gamma
-
-            # 8) Prune zero‐weight atoms
-            nz = [(a,w) for (a,w) in zip(atoms, weights) if w > 1e-12]
-            if nz:
-                atoms, weights = map(list, zip(*nz))
+            atom = self.lmo(grad, self.tau)
+            if atom not in atoms:
+                atoms.append(atom); weights.append(0.0)
+            idx_S = atoms.index(atom)
+            scores    = [np.sum(grad * a.to_matrix()) for a in atoms]
+            idx_away  = int(np.argmax(scores))
+            alpha_max = weights[idx_away]
+            S = atom.to_matrix()
+            if alpha_max <= 0:
+                d     = S - X
+                gamma = self._choose_step(X, grad, S, d, t)
+                weights[idx_S] += gamma
             else:
-                atoms, weights = [], []
-
+                V     = atoms[idx_away].to_matrix()
+                d     = S - V
+                gamma = min(self._choose_step(X, grad, S, d, t), alpha_max)
+                weights[idx_S]   += gamma
+                weights[idx_away] -= gamma
+            X += gamma * d
+            gap     = self._dual_gap(X, grad, S)
+            obj_val = self.obj.value(X)
+            self.history.append((t, gap, obj_val))
+            self.step_history.append(gamma)
+            self.times.append(time.perf_counter() - t0)
+            self.snapshots.append(X.copy())
+            self.weights_history.append(weights.copy())
+            nz = [(a,w) for a,w in zip(atoms,weights) if w>1e-12]
+            atoms, weights = map(list, zip(*nz)) if nz else ([], [])
+            if gap < self.tol: break
+            if obj_val < best_obj - self.tol_obj:
+                best_obj, no_imp = obj_val, 0
+            else:
+                no_imp += 1
+                if no_imp >= self.patience: break
         return X
-
