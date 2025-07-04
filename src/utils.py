@@ -9,15 +9,13 @@ def approximate_nuclear_norm(M: np.ndarray, k: int = 10, tol: float = 1e-3, maxi
     """
     Approximate the nuclear norm (trace norm) of M by summing its top-k singular values via svds.
     """
-    # ensure k is valid
     k = min(k, min(M.shape) - 1)
     if k <= 0:
-        return np.linalg.norm(M, ord='nuc')
+        return float(np.linalg.norm(M, ord='nuc'))
     try:
         u, s, vt = svds(M, k=k, tol=tol, maxiter=maxiter)
         return float(np.sum(s))
     except Exception:
-        # fallback to exact
         return float(np.linalg.norm(M, ord='nuc'))
 
 # ----------------------------------------------------------------
@@ -26,22 +24,22 @@ def approximate_nuclear_norm(M: np.ndarray, k: int = 10, tol: float = 1e-3, maxi
 def train_test_split_matrix(M_true: np.ndarray, test_fraction: float = 0.2, seed: int = 0):
     """
     Splits only over non-zero entries of M_true into train/test masks.
-    Returns: M_obs, mask_train, mask_test
+    Returns: M_obs, mask_train, mask_test, M_true
     """
     rng = np.random.RandomState(seed)
     # find indices of observed entries
     ui, ij = np.nonzero(M_true)
     n_obs = ui.size
-    # sample train/test
+    # sample train/test on observed indices
     train_flag = rng.rand(n_obs) < (1 - test_fraction)
     mask_train = np.zeros_like(M_true, dtype=bool)
+    mask_test  = np.zeros_like(M_true, dtype=bool)
     mask_train[ui[train_flag], ij[train_flag]] = True
-    mask_test = np.zeros_like(M_true, dtype=bool)
-    mask_test[ui[~train_flag], ij[~train_flag]] = True
-    # observed matrix
+    mask_test[ui[~train_flag], ij[~train_flag]]  = True
+    # observed training matrix
     M_obs = np.zeros_like(M_true)
     M_obs[mask_train] = M_true[mask_train]
-    return M_obs, mask_train, mask_test
+    return M_obs, mask_train, mask_test, M_true
 
 # ----------------------------------------------------------------
 # Loaders

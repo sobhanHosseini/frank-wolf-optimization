@@ -53,11 +53,13 @@ class ExperimentRunner:
     def run(self):
         for dataset in self.cfg['datasets']:
             print(f"\n=== Dataset: {dataset} ===")
-            M_obs, mask_train, M_true = load_dataset(
+            # unpack the four-tuple from our new loader
+            M_obs, mask_train, mask_test, M_true = load_dataset(
                 name=dataset,
                 test_fraction=self.cfg['test_fraction'],
                 seed=self.cfg['seed']
             )
+
             # Precompute rating range and SST for summary
             if dataset == 'jester2':
                 rmin, rmax = -10.0, 10.0
@@ -67,26 +69,24 @@ class ExperimentRunner:
                 vals = M_true[mask_train]
                 rmin, rmax = float(vals.min()), float(vals.max())
             rating_range = rmax - rmin
+
             y_tr = M_true[mask_train]
-            y_te = M_true[~mask_train]
-            mu_tr = y_tr.mean(); mu_te = y_te.mean()
+            y_te = M_true[mask_test]
+            mu_tr, mu_te = y_tr.mean(), y_te.mean()
             SST_tr = ((y_tr - mu_tr)**2).sum()
             SST_te = ((y_te - mu_te)**2).sum()
 
-            # Setup objective and tau
+            # Setup objective and tau (approximate on M_obs)
             obj = MatrixCompletionObjective(M_obs, mask_train)
-            k = self.cfg.get('tau_approx_k', None)
-            if k:
-                def_tau = approximate_nuclear_norm(M_true, k=k)
-                print(f"Approximated ||M_true||_* ≈ (top-{k}) sum = {def_tau:.3f}")
-            else:
-                def_tau = np.linalg.norm(M_true, ord='nuc')
-                print(f"Exact     ||M_true||_* = {def_tau:.3f}")
-                
-            tau     = self.cfg['tau_scale'] * def_tau
+            k_tau = self.cfg.get('tau_approx_k', 10)
+            def_tau = approximate_nuclear_norm(M_obs, k=k_tau)
+            print(f"Approximated ||M_obs||_* (top-{k_tau}) = {def_tau:.3f}")
+            tau = self.cfg['tau_scale'] * def_tau
+            print(f"Using tau = {tau:.3f}")
 
-            ds_results = {}
-            ds_solvers = {}
+            ds_results  = {}
+            ds_solvers  = {}
+
             for solver_name, Solver in [('FW', FrankWolfe), ('PFW', PairwiseFrankWolfe)]:
                 solver_map = {}
                 for step in self.cfg['steps']:
@@ -110,50 +110,57 @@ class ExperimentRunner:
                         continue
 
                     # Collect time series metrics
-                    it_arr     = np.array([h[0] for h in solver.history])
-                    gaps       = np.array([h[1] for h in solver.history])
-                    obj_vals   = np.array([h[2] for h in solver.history])
-                    rmse_tr    = np.sqrt(2 * obj_vals / mask_train.sum())
-                    snaps      = solver.snapshots[:iters]
-                    rmse_te    = np.array([evaluate(M_true, Xk, ~mask_train) for Xk in snaps])
-                    times      = np.array(solver.times)[1:iters+1]
-                    steps_hist = np.array(solver.step_history)
-                    weights_hist = getattr(solver, 'weights_history', None)
-                    if weights_hist is None:
-                        active_sz = np.zeros(iters, dtype=int)
-                    else:
-                        active_sz = np.array([len(w) for w in weights_hist])[:iters]
+                    it_arr   = np.array([h[0] for h in solver.history])
+                    gaps     = np.array([h[1] for h in solver.history])
+                    obj_vals = np.array([h[2] for h in solver.history])
+                    rmse_tr  = np.sqrt(2 * obj_vals / mask_train.sum())
+                    snaps    = solver.snapshots[:iters]
+                    rmse_te  = np.array([evaluate(M_true, Xk, mask_test) for Xk in snaps])
+                    times    = np.array(solver.times)[1:iters+1]
+                    steps    = np.array(solver.step_history)
+                    weights  = getattr(solver, 'weights_history', None)
+                    active_sz = (np.array([len(w) for w in weights])[:iters]
+                                if weights is not None
+                                else np.zeros(iters, dtype=int))
 
                     solver_map[step] = {
-                        'iters': it_arr,
-                        'gap': gaps,
-                        'obj_vals': obj_vals,
-                        'rmse_train': rmse_tr,
-                        'rmse_test': rmse_te,
-                        'times': times,
-                        'step_history': steps_hist,
+                        'iters':        it_arr,
+                        'gap':          gaps,
+                        'obj_vals':     obj_vals,
+                        'rmse_train':   rmse_tr,
+                        'rmse_test':    rmse_te,
+                        'times':        times,
+                        'step_history': steps,
                         'active_sizes': active_sz,
                     }
+
                     # Summary row
                     final_tr = rmse_tr[-1]
                     final_te = rmse_te[-1]
-                    nrm_tr = final_tr / rating_range
-                    nrm_te = final_te / rating_range
-                    Xf = solver.snapshots[-1]
-                    SSE_tr = ((Xf[mask_train] - y_tr)**2).sum()
-                    SSE_te = ((Xf[~mask_train] - y_te)**2).sum()
-                    R2_tr = 1 - SSE_tr / SST_tr if SST_tr > 0 else np.nan
-                    R2_te = 1 - SSE_te / SST_te if SST_te > 0 else np.nan
+                    nrm_tr   = final_tr / rating_range
+                    nrm_te   = final_te / rating_range
+                    Xf       = solver.snapshots[-1]
+                    SSE_tr   = ((Xf[mask_train] - y_tr)**2).sum()
+                    SSE_te   = ((Xf[mask_test]  - y_te)**2).sum()
+                    R2_tr    = 1 - SSE_tr / SST_tr if SST_tr > 0 else np.nan
+                    R2_te    = 1 - SSE_te / SST_te if SST_te > 0 else np.nan
+
                     self.summary_rows.append(
-                        (dataset, f"{solver_name}-{step}", final_tr, final_te,
-                         nrm_tr, nrm_te, R2_tr, R2_te, iters)
+                        (dataset, f"{solver_name}-{step}",
+                        final_tr, final_te,
+                        nrm_tr,   nrm_te,
+                        R2_tr,    R2_te,
+                        iters)
                     )
+
                 ds_results[solver_name] = solver_map
                 ds_solvers[solver_name] = solver
 
             self.results[dataset]     = ds_results
             self.solver_objs[dataset] = ds_solvers
+
         return self.results, self.solver_objs, self.summary_rows
+
 
 # ----------------------------------------------------------------------------
 # Plotter: visualizes results and prints tables
