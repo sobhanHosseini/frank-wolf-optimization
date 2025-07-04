@@ -157,7 +157,7 @@ class FrankWolfe:
         return X
 
 # ----------------------------------------------------------------
-# Pairwise Frank–Wolfe with logging
+# Pairwise Frank–Wolfe with optimized away selection
 # ----------------------------------------------------------------
 class PairwiseFrankWolfe(FrankWolfe):
     def run(self, X0=None):
@@ -174,23 +174,29 @@ class PairwiseFrankWolfe(FrankWolfe):
         for t in trange(self.max_iter, desc='Pairwise-FW'):
             grad = self.obj.gradient(X)
             atom = self.lmo(grad, self.tau)
+            # Register new atom if unseen
             if atom not in atoms:
-                atoms.append(atom); weights.append(0.0)
+                atoms.append(atom)
+                weights.append(0.0)
             idx_S = atoms.index(atom)
-            scores    = [np.sum(grad * a.to_matrix()) for a in atoms]
-            idx_away  = int(np.argmax(scores))
+            # Fast bilinear scoring for away atom selection
+            # score_i = <grad, S_i> = -tau * (u_i^T @ grad @ v_i)
+            scores = [ -a.tau * float(a.u.T @ grad @ a.v.T) for a in atoms ]
+            idx_away = int(np.argmax(scores))
             alpha_max = weights[idx_away]
+
             S = atom.to_matrix()
             if alpha_max <= 0:
-                d     = S - X
+                d = S - X
                 gamma = self._choose_step(X, grad, S, d, t)
                 weights[idx_S] += gamma
             else:
-                V     = atoms[idx_away].to_matrix()
-                d     = S - V
+                V = atoms[idx_away].to_matrix()
+                d = S - V
                 gamma = min(self._choose_step(X, grad, S, d, t), alpha_max)
                 weights[idx_S]   += gamma
                 weights[idx_away] -= gamma
+
             X += gamma * d
             gap     = self._dual_gap(X, grad, S)
             obj_val = self.obj.value(X)
@@ -199,8 +205,10 @@ class PairwiseFrankWolfe(FrankWolfe):
             self.times.append(time.perf_counter() - t0)
             self.snapshots.append(X.copy())
             self.weights_history.append(weights.copy())
+            # Prune zero-weight atoms
             nz = [(a,w) for a,w in zip(atoms,weights) if w>1e-12]
             atoms, weights = map(list, zip(*nz)) if nz else ([], [])
+
             if gap < self.tol: break
             if obj_val < best_obj - self.tol_obj:
                 best_obj, no_imp = obj_val, 0
