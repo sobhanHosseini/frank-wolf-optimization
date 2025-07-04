@@ -53,45 +53,43 @@ class ExperimentRunner:
     def run(self):
       for dataset in self.cfg['datasets']:
           print(f"\n=== Dataset: {dataset} ===")
-          # unpack the four-tuple from our new loader
+          # 1) load train/test split (only on nonzeros)
           M_obs, mask_train, mask_test, M_true = load_dataset(
               name=dataset,
               test_fraction=self.cfg['test_fraction'],
               seed=self.cfg['seed']
           )
 
-          # Precompute rating range and SST for summary
-          if dataset == 'jester2':
-              rmin, rmax = -10.0, 10.0
-          elif dataset in ('ml-100k', 'ml-1m'):
-              rmin, rmax = 1.0, 5.0
-          else:
-              vals = M_true[mask_train]
-              rmin, rmax = float(vals.min()), float(vals.max())
+          # 2) compute and subtract train mean
+          mu_tr = M_true[mask_train].mean()
+          M_obs_centered = M_obs.copy()
+          M_obs_centered[mask_train] -= mu_tr
+
+          # 3) stats for summary
+          rmin, rmax = ((-10.0,10.0) if dataset=='jester2'
+                        else (1.0,5.0) if dataset in ('ml-100k','ml-1m')
+                        else (float(M_true[mask_train].min()), float(M_true[mask_train].max())))
           rating_range = rmax - rmin
+          y_tr = M_true[mask_train] - mu_tr
+          y_te = M_true[mask_test]  - mu_tr
+          SST_tr = ((y_tr)**2).sum()
+          SST_te = ((y_te)**2).sum()
 
-          # Train/test vectors and sums of squares
-          y_tr = M_true[mask_train]
-          y_te = M_true[mask_test]
-          mu_tr, mu_te = y_tr.mean(), y_te.mean()
-          SST_tr = ((y_tr - mu_tr)**2).sum()
-          SST_te = ((y_te - mu_te)**2).sum()
+          # 4) setup objective on the centered data
+          obj = MatrixCompletionObjective(M_obs_centered, mask_train)
 
-          # Setup objective and tau (approximate on M_obs)
-          obj = MatrixCompletionObjective(M_obs, mask_train)
-          k_tau = self.cfg.get('tau_approx_k', 10)
-          def_tau = approximate_nuclear_norm(M_obs, k=k_tau)
-          print(f"Approximated ||M_obs||_* (top-{k_tau}) = {def_tau:.3f}")
-          tau = self.cfg['tau_scale'] * def_tau
-          print(f"Using tau = {tau:.3f}")
+          # 5) estimate tau from centered M_obs
+          from utils import approximate_nuclear_norm
+          k_tau   = self.cfg.get('tau_approx_k', 10)
+          def_tau = approximate_nuclear_norm(M_obs_centered, k=k_tau)
+          tau     = self.cfg['tau_scale'] * def_tau
+          print(f"μ_train={mu_tr:.3f}, τ≈{def_tau:.3f} → using τ={tau:.3f}")
 
-          ds_results = {}
-          ds_solvers = {}
-
-          for solver_name, Solver in [('FW', FrankWolfe), ('PFW', PairwiseFrankWolfe)]:
+          ds_results, ds_solvers = {}, {}
+          for solver_name, Solver in [('FW',FrankWolfe),('PFW',PairwiseFrankWolfe)]:
               solver_map = {}
               for step in self.cfg['steps']:
-                  print(f"--- {solver_name} with step='{step}' ---")
+                  print(f"--- {solver_name} step={step} ---")
                   solver = Solver(
                       objective=obj,
                       lmo_fn=nuclear_norm_lmo,
@@ -102,49 +100,42 @@ class ExperimentRunner:
                       tol_obj=self.cfg['tol_obj'],
                       patience=self.cfg['patience']
                   )
-                  start = time.time()
+                  t0 = time.time()
                   solver.run()
-                  duration = time.time() - start
+                  dur = time.time()-t0
                   iters = len(solver.history)
-                  print(f"Finished in {duration:.2f}s, iterations = {iters}")
-                  if iters == 0:
-                      continue
+                  print(f"  done in {dur:.1f}s, iter={iters}")
 
-                  # Time‐series metrics
-                  it_arr   = np.array([h[0] for h in solver.history])
-                  gaps     = np.array([h[1] for h in solver.history])
-                  obj_vals = np.array([h[2] for h in solver.history])
-                  rmse_tr  = np.sqrt(2 * obj_vals / mask_train.sum())
-                  snaps    = solver.snapshots[:iters]
-                  rmse_te  = np.array([evaluate(M_true, Xk, mask_test) for Xk in snaps])
-                  times    = np.array(solver.times)[1:iters+1]
-                  steps    = np.array(solver.step_history)
-                  weights  = getattr(solver, 'weights_history', None)
-                  active_sz = (np.array([len(w) for w in weights])[:iters]
-                              if weights is not None
-                              else np.zeros(iters, dtype=int))
+                  if iters==0: continue
+                  # collect histories
+                  its     = np.array([h[0] for h in solver.history])
+                  gaps    = np.array([h[1] for h in solver.history])
+                  objs    = np.array([h[2] for h in solver.history])
+                  snaps   = solver.snapshots[:iters]
+                  # re-add mu_tr for each snapshot before RMSE
+                  rmse_tr = np.sqrt( np.mean(((np.array(snaps)+mu_tr)[mask_train] - M_true[mask_train])**2, axis=1) )
+                  rmse_te = np.array([ evaluate(M_true, Xk+mu_tr, mask_test)
+                                      for Xk in snaps ])
+                  times   = np.array(solver.times)[1:iters+1]
+                  steps_h = np.array(solver.step_history)
+                  weights = getattr(solver,'weights_history',None)
+                  active  = np.array([len(w) for w in weights])[:iters] if weights else np.zeros(iters,int)
 
-                  solver_map[step] = {
-                      'iters':        it_arr,
-                      'gap':          gaps,
-                      'obj_vals':     obj_vals,
-                      'rmse_train':   rmse_tr,
-                      'rmse_test':    rmse_te,
-                      'times':        times,
-                      'step_history': steps,
-                      'active_sizes': active_sz,
-                  }
+                  solver_map[step] = dict(
+                      iters=its, gap=gaps, obj_vals=objs,
+                      rmse_train=rmse_tr, rmse_test=rmse_te,
+                      times=times, step_history=steps_h,
+                      active_sizes=active
+                  )
 
-                  # Summary row
-                  final_tr = rmse_tr[-1]
-                  final_te = rmse_te[-1]
-                  nrm_tr   = final_tr / rating_range
-                  nrm_te   = final_te / rating_range
-                  Xf       = solver.snapshots[-1]
-                  SSE_tr   = ((Xf[mask_train] - y_tr)**2).sum()
-                  SSE_te   = ((Xf[mask_test]  - y_te)**2).sum()
-                  R2_tr    = 1 - SSE_tr / SST_tr if SST_tr > 0 else np.nan
-                  R2_te    = 1 - SSE_te / SST_te if SST_te > 0 else np.nan
+                  # summary row
+                  final_tr, final_te = rmse_tr[-1], rmse_te[-1]
+                  nrm_tr, nrm_te     = final_tr/rating_range, final_te/rating_range
+                  Xf = snaps[-1] + mu_tr
+                  SSE_tr = ((Xf[mask_train]-M_true[mask_train])**2).sum()
+                  SSE_te = ((Xf[mask_test] -M_true[mask_test]) **2).sum()
+                  R2_tr  = 1 - SSE_tr/SST_tr if SST_tr>0 else np.nan
+                  R2_te  = 1 - SSE_te/SST_te if SST_te>0 else np.nan
 
                   self.summary_rows.append(
                       (dataset, f"{solver_name}-{step}",
@@ -161,6 +152,7 @@ class ExperimentRunner:
           self.solver_objs[dataset] = ds_solvers
 
       return self.results, self.solver_objs, self.summary_rows
+
 
 
 
