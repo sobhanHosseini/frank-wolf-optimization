@@ -82,6 +82,7 @@ class FrankWolfe:
         patience: int = 10,
         snapshot_dtype: type = np.float32
     ):
+        print('test ...')
         # problem
         self.obj             = objective
         self.lmo             = lmo_fn
