@@ -1,5 +1,6 @@
 import numpy as np
 import pandas as pd
+from scipy.sparse.linalg import svds
 
 def evaluate(M_true, X_pred, mask):
     """
@@ -9,6 +10,15 @@ def evaluate(M_true, X_pred, mask):
     if diff.size == 0:
         return 0.0
     return np.sqrt(np.mean(diff ** 2))
+
+def approximate_nuclear_norm(M: np.ndarray, k: int = 10) -> float:
+    """
+    Approximate the nuclear norm of M by summing its top-k singular values.
+    This runs in O(k·(n+m)) instead of O(n·m·min(n,m)).
+    """
+    # svds returns the k largest singular values in ascending order
+    u, s, vt = svds(M, k=min(k, min(M.shape)-1), tol=1e-3, maxiter=200)
+    return float(np.sum(s))
 
 def load_jester2(path="./data/jester2/jester_ratings.dat",
                  test_fraction=0.2, seed=0):
