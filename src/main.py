@@ -163,25 +163,159 @@ class ExperimentRunner:
 # ----------------------------------------------------------------------------
 class ExperimentPlotter:
     def __init__(self, results, summary_rows, cfg):
-        self.results = results
+        self.results      = results
         self.summary_rows = summary_rows
-        self.cfg = cfg
+        self.cfg          = cfg
+
+    def _plot_gap(self, ax, data):
+        for sname, dd in data.items():
+            for step, d in dd.items():
+                idx = subsample_indices(len(d['snap_iters']))
+                ax.loglog(
+                    d['snap_iters'][idx],
+                    np.maximum(d['gap'][idx], 1e-16),
+                    label=f"{sname}-{step}"
+                )
+        ax.set(title='Gap vs Iter', xlabel='Iteration', ylabel='Duality Gap')
+        ax.legend(); ax.grid(True, which='both')
+
+    def _plot_obj_vs_time(self, ax, data):
+        for sname, dd in data.items():
+            for step, d in dd.items():
+                idx = subsample_indices(len(d['times']))
+                ax.plot(
+                    d['times'][idx],
+                    d['obj_vals'][idx],
+                    label=f"{sname}-{step}"
+                )
+        ax.set(title='Obj vs Time', xlabel='Time (s)', ylabel='Objective')
+        ax.legend(); ax.grid(True)
 
     def _plot_rmse_vs_iter(self, ax, data):
         for sname, dd in data.items():
             for step, d in dd.items():
                 idx = subsample_indices(len(d['snap_iters']))
-                ax.plot(d['snap_iters'][idx], d['rmse_train'][idx], '--', label=f"{sname}-{step}-train")
-                ax.plot(d['snap_iters'][idx], d['rmse_test'][idx],  '-', label=f"{sname}-{step}-test")
+                ax.plot(
+                    d['snap_iters'][idx],
+                    d['rmse_train'][idx],
+                    '--',
+                    label=f"{sname}-{step}-train"
+                )
+                ax.plot(
+                    d['snap_iters'][idx],
+                    d['rmse_test'][idx],
+                    '-',
+                    label=f"{sname}-{step}-test"
+                )
         ax.set(title='RMSE vs Iter', xlabel='Iteration', ylabel='RMSE')
+        ax.legend(); ax.grid(True)
+
+    def _plot_active_set(self, ax, data):
+        if 'PFW' in data:
+            for step, d in data['PFW'].items():
+                idx = subsample_indices(len(d['snap_iters']))
+                ax.plot(
+                    d['snap_iters'][idx],
+                    d['active_sizes'][idx],
+                    '-o',
+                    label=step
+                )
+        ax.set(title='PFW Active-set Growth', xlabel='Iteration', ylabel='Active-set size')
+        ax.legend(); ax.grid(True)
+
+    def _plot_step_size(self, ax, data):
+        for sname, dd in data.items():
+            for step, d in dd.items():
+                idx = subsample_indices(len(d['snap_iters']))
+                ax.plot(
+                    d['snap_iters'][idx],
+                    d['step_history'][idx],
+                    'o-',
+                    label=f"{sname}-{step}"
+                )
+        ax.set(title='Step-size vs Iter', xlabel='Iteration', ylabel='Step-size γₖ')
+        ax.set_yscale('log'); ax.legend(); ax.grid(True)
+
+    def _plot_rmse_vs_rank(self, ax, data):
+        for sname, dd in data.items():
+            for step, d in dd.items():
+                # for FW: rank = iter_idx + 1; for PFW: rank = active_sizes
+                if sname == 'PFW':
+                    ranks = d['active_sizes']
+                else:
+                    ranks = d['snap_iters']  # each FW adds one rank per iter
+                idx = subsample_indices(len(ranks))
+                ax.plot(
+                    np.array(ranks)[idx],
+                    d['rmse_train'][idx],
+                    '-o',
+                    label=f"{sname}-{step}"
+                )
+        ax.set(title='Train RMSE vs Rank', xlabel='Rank', ylabel='Train RMSE')
         ax.legend(); ax.grid(True)
 
     def plot(self):
         for dataset, data in self.results.items():
             print(f"\n=== Results for {dataset} ===")
+            fig, axes = plt.subplots(2, 3, figsize=(18, 10))
+            for ax in axes.flatten():
+                ax.set_axisbelow(True)
+
+            # call each subplot
+            self._plot_gap(axes[0,0], data)
+            self._plot_obj_vs_time(axes[0,1], data)
+            self._plot_rmse_vs_iter(axes[0,2], data)
+            self._plot_active_set(axes[1,0], data)
+            self._plot_step_size(axes[1,1], data)
+            self._plot_rmse_vs_rank(axes[1,2], data)
+
+            plt.tight_layout()
+            plt.suptitle(f"Diagnostics {dataset}", y=1.02)
+            if self.cfg['save_plots']:
+                fig.savefig(os.path.join(self.cfg['plot_dir'], f"{dataset}_diagnostics.png"))
+            plt.show()
+            plt.close(fig)
+
+            # Summary table per dataset
+            rows = [r for r in self.summary_rows if r[0] == dataset]
+            hdr = (
+                f"{'Dataset':10s}{'Solver-Step':20s}{'RMSE_tr':>8s}"
+                f"{'RMSE_te':>8s}{'NRMSE_tr':>8s}{'NRMSE_te':>8s}"
+                f"{'R2_tr':>8s}{'R2_te':>8s}{'Iters':>6s}"
+            )
+            print(hdr)
+            print('-' * len(hdr))
+            for ds, solstep, tr, te, ntr, nte, r2t, r2e, it in rows:
+                print(f"{ds:10s}{solstep:20s}{tr:8.4f}{te:8.4f}{ntr:8.4f}{nte:8.4f}{r2t:8.4f}{r2e:8.4f}{it:6d}")
+
+        # Combined table across all datasets
+        if len(self.cfg['datasets'])>1:
+            print("\n=== Combined Summary ===")
+            hdr = f"{'Dataset':10s}{'Solver-Step':20s}{'RMSE_tr':>8s}{'RMSE_te':>8s}{'NRMSE_tr':>8s}{'NRMSE_te':>8s}{'R2_tr':>8s}{'R2_te':>8s}{'Iters':>6s}"
+            print(hdr)
+            print('-'*len(hdr))
+            for ds, solstep, tr, te, ntr, nte, r2t, r2e, it in self.summary_rows:
+                print(f"{ds:10s}{solstep:20s}{tr:8.4f}{te:8.4f}{ntr:8.4f}{nte:8.4f}{r2t:8.4f}{r2e:8.4f}{it:6d}")
+
+        # Cross-dataset NRMSE plot
+        if len(self.cfg['datasets'])>1:
+            ds_list = self.cfg['datasets']
+            x = np.arange(len(ds_list))
             fig, ax = plt.subplots(figsize=(6,4))
-            self._plot_rmse_vs_iter(ax, data)
-            plt.tight_layout(); plt.show()
+            for solver_name in ['FW','PFW']:
+                for step in self.cfg['steps']:
+                    y = []
+                    for ds in ds_list:
+                        d = self.results[ds][solver_name][step]
+                        y.append(d['rmse_test'][-1] / (20 if ds=='jester2' else 4))
+                    ax.plot(x, y, '-o', label=f"{solver_name}-{step}")
+            ax.set_xticks(x); ax.set_xticklabels(ds_list)
+            ax.set(title='Test NRMSE Across Datasets', xlabel='Dataset', ylabel='Test NRMSE')
+            ax.legend(); ax.grid(True)
+            plt.tight_layout()
+            if self.cfg['save_plots']:
+                fig.savefig(os.path.join(self.cfg['plot_dir'], "cross_dataset_nrmse.png"))
+            plt.show()
 
 # ----------------------------------------------------------------------------
 # Main execution
