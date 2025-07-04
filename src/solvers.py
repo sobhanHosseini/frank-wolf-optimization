@@ -82,7 +82,6 @@ class FrankWolfe:
         snapshot_dtype: type = np.float32,
         snapshot_interval: int = 5
     ):
-        print("test....")
         # problem
         self.obj              = objective
         self.lmo              = lmo_fn
@@ -99,6 +98,7 @@ class FrankWolfe:
         self.history          = []  # (iter, gap, obj)
         self.times            = []  # wall-clock times
         self.snapshots        = []  # selected X iterates
+        self.snapshot_iters   = []  # iteration indices for snapshots
         self.step_history     = []  # gamma iterates
 
     def _dual_gap(self, X, grad, S):
@@ -136,6 +136,7 @@ class FrankWolfe:
         X = np.zeros_like(self.obj.M_obs) if X0 is None else X0.copy()
         # initial snapshot
         self.snapshots.append(X.astype(self.snapshot_dtype,copy=False).copy())
+        self.snapshot_iters.append(0)
         t0 = time.perf_counter()
         self.times.append(0.0)
         best_obj, no_imp = float('inf'),0
@@ -160,6 +161,7 @@ class FrankWolfe:
             # conditional snapshot
             if (t+1)%self.snapshot_interval==0 or t==self.max_iter-1:
                 self.snapshots.append(X.astype(self.snapshot_dtype,copy=False).copy())
+                self.snapshot_iters.append(t+1)
         return X
 
 # ----------------------------------------------------------------
@@ -169,6 +171,7 @@ class PairwiseFrankWolfe(FrankWolfe):
     def run(self, X0=None):
         X = np.zeros_like(self.obj.M_obs) if X0 is None else X0.copy()
         self.snapshots = [X.astype(self.snapshot_dtype,copy=False).copy()]
+        self.snapshot_iters = [0]
         t0 = time.perf_counter()
         self.times = [0.0]
         self.history = []
@@ -204,9 +207,10 @@ class PairwiseFrankWolfe(FrankWolfe):
             self.step_history.append(gamma)
             self.times.append(time.perf_counter()-t0)
             self.weights_history.append(weights.copy())
+            # conditional snapshot
             if (t+1)%self.snapshot_interval==0 or t==self.max_iter-1:
                 self.snapshots.append(X.astype(self.snapshot_dtype,copy=False).copy())
-            # prune
+                self.snapshot_iters.append(t+1)
             nz=[(a,w) for a,w in zip(atoms,weights) if w>1e-12]
             atoms,weights = map(list,zip(*nz)) if nz else ([],[])
             if gap<self.tol: break
