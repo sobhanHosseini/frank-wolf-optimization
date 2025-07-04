@@ -16,7 +16,7 @@ from solvers import (
 # Configuration: datasets and step rules
 # ----------------------------------------------------------------------------
 config = {
-    'datasets':      ['ml-100k', 'jester2'],  # multiple datasets
+    'datasets':      ['ml-1m'],  # multiple datasets
     'steps':         [ 'analytic'],  # FW/PFW step rules
     'test_fraction': 0.2,
     'seed':          42,
@@ -84,7 +84,6 @@ class ExperimentRunner:
                 print(f"Exact     ||M_true||_* = {def_tau:.3f}")
                 
             tau     = self.cfg['tau_scale'] * def_tau
-            print(f"Using tau = {tau:.3f} (||M_true||_* = {def_tau:.3f})")
 
             ds_results = {}
             ds_solvers = {}
@@ -224,36 +223,39 @@ class ExperimentPlotter:
 
     def _plot_rmse_vs_rank(self, ax, data):
         for sname, dd in data.items():
-            rmse = dd['analytic']['rmse_train']
-            if sname == 'PFW':
-                ranks = dd['active_sizes']
-            else:
-                ranks = dd['iters'] + 1
-            idx = subsample_indices(len(ranks))
-            ax.plot(
-                np.array(ranks)[idx],
-                rmse[idx],
-                '-o', label=sname
-            )
+            for step, d in dd.items():
+                # Determine rank history without expensive SVD
+                if sname == 'PFW':
+                    ranks = d['active_sizes']
+                else:
+                    ranks = d['iters'] + 1
+                rmse = d['rmse_train']
+                idx = subsample_indices(len(ranks))
+                ax.plot(
+                    np.array(ranks)[idx],
+                    rmse[idx],
+                    '-o', label=f"{sname}-{step}"
+                )
         ax.set(title='Train RMSE vs Rank', xlabel='Rank', ylabel='Train RMSE')
         ax.legend(); ax.grid(True)
 
     def plot(self):
+        # Loop over datasets
         for dataset in self.cfg['datasets']:
             print(f"\n=== Results for {dataset} ===")
             data    = self.results[dataset]
-            # create subplots
+            # Create 2x3 diagnostic subplots
             fig, axes = plt.subplots(2, 3, figsize=(18, 10))
             for ax in axes.flatten():
                 ax.set_axisbelow(True)
-            # call modular plot methods
-            self._plot_gap(axes[0,0], data)
-            self._plot_obj_vs_time(axes[0,1], data)
-            self._plot_rmse_vs_iter(axes[0,2], data)
-            self._plot_active_set(axes[1,0], data)
-            self._plot_step_size(axes[1,1], data)
-            self._plot_rmse_vs_rank(axes[1,2], data)
-            # finalize
+            # Plot diagnostics
+            self._plot_gap(axes[0, 0], data)
+            self._plot_obj_vs_time(axes[0, 1], data)
+            self._plot_rmse_vs_iter(axes[0, 2], data)
+            self._plot_active_set(axes[1, 0], data)
+            self._plot_step_size(axes[1, 1], data)
+            self._plot_rmse_vs_rank(axes[1, 2], data)
+            # Finalize layout and title
             plt.tight_layout()
             plt.suptitle(f"Diagnostics {dataset}", y=1.02)
             if self.cfg['save_plots']:
@@ -263,14 +265,14 @@ class ExperimentPlotter:
             plt.close(fig)
 
             # Summary table per dataset
-            rows = [r for r in self.summary_rows if r[0]==dataset]
+            rows = [r for r in self.summary_rows if r[0] == dataset]
             hdr = (
                 f"{'Dataset':10s}{'Solver-Step':20s}{'RMSE_tr':>8s}"
-                f"{'RMSE_te':>8s}{'NRMSE_tr':>8s}{'NRMSE_te':>8s}"  
+                f"{'RMSE_te':>8s}{'NRMSE_tr':>8s}{'NRMSE_te':>8s}"
                 f"{'R2_tr':>8s}{'R2_te':>8s}{'Iters':>6s}"
             )
             print(hdr)
-            print('-'*len(hdr))
+            print('-' * len(hdr))
             for ds, solstep, tr, te, ntr, nte, r2t, r2e, it in rows:
                 print(f"{ds:10s}{solstep:20s}{tr:8.4f}{te:8.4f}{ntr:8.4f}{nte:8.4f}{r2t:8.4f}{r2e:8.4f}{it:6d}")
 

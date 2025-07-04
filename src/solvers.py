@@ -66,7 +66,7 @@ class Atom:
         return f"Atom(tau={self.tau}, u_shape={self.u.shape}, v_shape={self.v.shape})"
 
 # ----------------------------------------------------------------
-# Frank–Wolfe solver with logging
+# Frank–Wolfe solver with logging and memory-efficient snapshots
 # ----------------------------------------------------------------
 class FrankWolfe:
     def __init__(
@@ -79,23 +79,27 @@ class FrankWolfe:
         step_method: str = 'vanilla',
         fixed_gamma: float = 0.1,
         tol_obj: float = 1e-6,
-        patience: int = 10
+        patience: int = 10,
+        snapshot_dtype: type = np.float32
     ):
+        print("test...")
         # problem
-        self.obj          = objective
-        self.lmo          = lmo_fn
-        self.tau          = tau
-        self.max_iter     = max_iter
-        self.tol          = tol
-        self.step_method  = step_method
-        self.fixed_gamma  = fixed_gamma
-        self.tol_obj      = tol_obj
-        self.patience     = patience
+        self.obj             = objective
+        self.lmo             = lmo_fn
+        self.tau             = tau
+        self.max_iter        = max_iter
+        self.tol             = tol
+        self.step_method     = step_method
+        self.fixed_gamma     = fixed_gamma
+        self.tol_obj         = tol_obj
+        self.patience        = patience
+        # snapshot dtype for reduced memory
+        self.snapshot_dtype  = snapshot_dtype
         # logging and histories
-        self.history      = []  # (iter, gap, obj)
-        self.times        = []  # wall-clock times
-        self.snapshots    = []  # X iterates
-        self.step_history = []  # gamma iterates
+        self.history         = []  # (iter, gap, obj)
+        self.times           = []  # wall-clock times
+        self.snapshots       = []  # X iterates (float32)
+        self.step_history    = []  # gamma iterates
 
     def _dual_gap(self, X, grad, S):
         raw = -np.sum((S - X) * grad)
@@ -130,7 +134,8 @@ class FrankWolfe:
 
     def run(self, X0=None):
         X = np.zeros_like(self.obj.M_obs) if X0 is None else X0.copy()
-        self.snapshots.append(X.copy())
+        # store initial snapshot as float32
+        self.snapshots.append(X.astype(self.snapshot_dtype, copy=False).copy())
         t0 = time.perf_counter()
         self.times.append(0.0)
 
@@ -152,20 +157,22 @@ class FrankWolfe:
             gamma = self._choose_step(X, grad, S, d, t)
             X    += gamma * d
             self.step_history.append(gamma)
-            self.snapshots.append(X.copy())
+            # reduced-memory snapshot
+            self.snapshots.append(X.astype(self.snapshot_dtype, copy=False).copy())
             self.times.append(time.perf_counter() - t0)
         return X
 
 # ----------------------------------------------------------------
-# Pairwise Frank–Wolfe with optimized away selection
+# Pairwise Frank–Wolfe with optimized away selection and memory-efficient snapshots
 # ----------------------------------------------------------------
 class PairwiseFrankWolfe(FrankWolfe):
     def run(self, X0=None):
         X = np.zeros_like(self.obj.M_obs) if X0 is None else X0.copy()
-        self.snapshots    = [X.copy()]
+        # initial snapshot
+        self.snapshots   = [X.astype(self.snapshot_dtype, copy=False).copy()]
         t0 = time.perf_counter()
-        self.times        = [0.0]
-        self.history      = []
+        self.times       = [0.0]
+        self.history     = []
         self.step_history = []
         self.weights_history = []
 
@@ -174,13 +181,10 @@ class PairwiseFrankWolfe(FrankWolfe):
         for t in trange(self.max_iter, desc='Pairwise-FW'):
             grad = self.obj.gradient(X)
             atom = self.lmo(grad, self.tau)
-            # Register new atom if unseen
             if atom not in atoms:
-                atoms.append(atom)
-                weights.append(0.0)
-            idx_S = atoms.index(atom)
-            # Fast bilinear scoring for away atom selection
-            # score_i = <grad, S_i> = -tau * (u_i^T @ grad @ v_i)
+                atoms.append(atom); weights.append(0.0)
+            idx_S   = atoms.index(atom)
+            # fast bilinear scoring
             scores = [ -a.tau * float(a.u.T @ grad @ a.v.T) for a in atoms ]
             idx_away = int(np.argmax(scores))
             alpha_max = weights[idx_away]
@@ -203,9 +207,10 @@ class PairwiseFrankWolfe(FrankWolfe):
             self.history.append((t, gap, obj_val))
             self.step_history.append(gamma)
             self.times.append(time.perf_counter() - t0)
-            self.snapshots.append(X.copy())
+            # reduced-memory snapshot
+            self.snapshots.append(X.astype(self.snapshot_dtype, copy=False).copy())
             self.weights_history.append(weights.copy())
-            # Prune zero-weight atoms
+            # prune near-zero atoms
             nz = [(a,w) for a,w in zip(atoms,weights) if w>1e-12]
             atoms, weights = map(list, zip(*nz)) if nz else ([], [])
 
