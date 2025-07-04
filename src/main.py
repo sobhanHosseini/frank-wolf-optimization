@@ -140,6 +140,7 @@ class ExperimentRunner:
                     }
 
                     # summary
+                    n_iters = len(solver.history)
                     final_tr, final_te = rmse_tr[-1], rmse_te[-1]
                     nrm_tr = final_tr / rating_range
                     nrm_te = final_te / rating_range
@@ -150,7 +151,7 @@ class ExperimentRunner:
                          final_tr, final_te,
                          nrm_tr, nrm_te,
                          R2_tr,  R2_te,
-                         len(snaps))
+                         n_iters)
                     )
 
                 ds_results[solver_name] = solver_map
