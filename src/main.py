@@ -66,8 +66,6 @@ class ExperimentRunner:
             vals = M_true[mask_train]
             rmin, rmax = float(vals.min()), float(vals.max())
             rating_range = rmax - rmin
-            print(f'rmax={rmax}, rmin={rmin} → dataset {dataset} ')
-            
             
             # centered train/test targets
             y_tr = M_true[mask_train] - mu_tr
