@@ -53,14 +53,12 @@ class ExperimentRunner:
     def run(self):
       for dataset in self.cfg['datasets']:
           print(f"\n=== Dataset: {dataset} ===")
-          # load_dataset still returns (M_obs, mask_train, M_true)
-          M_obs, mask_train, M_true = load_dataset(
+          # unpack the four-tuple from our new loader
+          M_obs, mask_train, mask_test, M_true = load_dataset(
               name=dataset,
               test_fraction=self.cfg['test_fraction'],
               seed=self.cfg['seed']
           )
-          # build test mask: only those entries that were observed but not in train
-          mask_test = (~mask_train) & (M_true != 0)
 
           # Precompute rating range and SST for summary
           if dataset == 'jester2':
@@ -79,9 +77,8 @@ class ExperimentRunner:
           SST_tr = ((y_tr - mu_tr)**2).sum()
           SST_te = ((y_te - mu_te)**2).sum()
 
-          # Objective on M_obs, tau from training data only
+          # Setup objective and tau (approximate on M_obs)
           obj = MatrixCompletionObjective(M_obs, mask_train)
-          from utils import approximate_nuclear_norm
           k_tau = self.cfg.get('tau_approx_k', 10)
           def_tau = approximate_nuclear_norm(M_obs, k=k_tau)
           print(f"Approximated ||M_obs||_* (top-{k_tau}) = {def_tau:.3f}")
