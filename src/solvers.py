@@ -66,7 +66,7 @@ class Atom:
         return f"Atom(tau={self.tau}, u_shape={self.u.shape}, v_shape={self.v.shape})"
 
 # ----------------------------------------------------------------
-# Frank–Wolfe solver with logging and memory-efficient snapshots
+# Frank–Wolfe solver with logging, early RMSE stopping, and memory-efficient snapshots
 # ----------------------------------------------------------------
 class FrankWolfe:
     def __init__(
@@ -82,7 +82,6 @@ class FrankWolfe:
         patience: int = 10,
         snapshot_dtype: type = np.float32
     ):
-        print("test...")
         # problem
         self.obj             = objective
         self.lmo             = lmo_fn
@@ -93,8 +92,7 @@ class FrankWolfe:
         self.fixed_gamma     = fixed_gamma
         self.tol_obj         = tol_obj
         self.patience        = patience
-        # snapshot dtype for reduced memory
-        self.snapshot_dtype  = snapshot_dtype
+        self.snapshot_dtype  = snapshot_dtype  # for reduced memory
         # logging and histories
         self.history         = []  # (iter, gap, obj)
         self.times           = []  # wall-clock times
@@ -134,12 +132,15 @@ class FrankWolfe:
 
     def run(self, X0=None):
         X = np.zeros_like(self.obj.M_obs) if X0 is None else X0.copy()
-        # store initial snapshot as float32
+        # initial snapshot
         self.snapshots.append(X.astype(self.snapshot_dtype, copy=False).copy())
         t0 = time.perf_counter()
         self.times.append(0.0)
 
         best_obj, no_imp = float('inf'), 0
+        last_rmse, rmse_no_imp = float('inf'), 0
+        mask_count = float(self.obj.mask.sum())
+
         for t in trange(self.max_iter, desc='Frank-Wolfe'):
             grad    = self.obj.gradient(X)
             atom    = self.lmo(grad, self.tau)
@@ -147,13 +148,27 @@ class FrankWolfe:
             d       = S - X
             gap     = self._dual_gap(X, grad, S)
             obj_val = self.obj.value(X)
+            # compute train RMSE
+            rmse = np.sqrt(2 * obj_val / mask_count)
+
             self.history.append((t, gap, obj_val))
-            if gap < self.tol: break
+            if gap < self.tol:
+                break
+            # objective-based patience
             if obj_val < best_obj - self.tol_obj:
                 best_obj, no_imp = obj_val, 0
             else:
                 no_imp += 1
-                if no_imp >= self.patience: break
+                if no_imp >= self.patience:
+                    break
+            # RMSE-based early stop
+            if abs(last_rmse - rmse) < 1e-4:
+                rmse_no_imp += 1
+                if rmse_no_imp >= self.patience:
+                    break
+            else:
+                last_rmse, rmse_no_imp = rmse, 0
+
             gamma = self._choose_step(X, grad, S, d, t)
             X    += gamma * d
             self.step_history.append(gamma)
@@ -163,12 +178,11 @@ class FrankWolfe:
         return X
 
 # ----------------------------------------------------------------
-# Pairwise Frank–Wolfe with optimized away selection and memory-efficient snapshots
+# Pairwise Frank–Wolfe with optimized away selection, early RMSE stopping, and memory-efficient snapshots
 # ----------------------------------------------------------------
 class PairwiseFrankWolfe(FrankWolfe):
     def run(self, X0=None):
         X = np.zeros_like(self.obj.M_obs) if X0 is None else X0.copy()
-        # initial snapshot
         self.snapshots   = [X.astype(self.snapshot_dtype, copy=False).copy()]
         t0 = time.perf_counter()
         self.times       = [0.0]
@@ -178,14 +192,18 @@ class PairwiseFrankWolfe(FrankWolfe):
 
         atoms, weights = [], []
         best_obj, no_imp = float('inf'), 0
+        last_rmse, rmse_no_imp = float('inf'), 0
+        mask_count = float(self.obj.mask.sum())
+
         for t in trange(self.max_iter, desc='Pairwise-FW'):
             grad = self.obj.gradient(X)
             atom = self.lmo(grad, self.tau)
             if atom not in atoms:
-                atoms.append(atom); weights.append(0.0)
-            idx_S   = atoms.index(atom)
+                atoms.append(atom)
+                weights.append(0.0)
+            idx_S = atoms.index(atom)
             # fast bilinear scoring
-            scores = [ -a.tau * float(a.u.T @ grad @ a.v.T) for a in atoms ]
+            scores = [-a.tau * float(a.u.T @ grad @ a.v.T) for a in atoms]
             idx_away = int(np.argmax(scores))
             alpha_max = weights[idx_away]
 
@@ -204,20 +222,33 @@ class PairwiseFrankWolfe(FrankWolfe):
             X += gamma * d
             gap     = self._dual_gap(X, grad, S)
             obj_val = self.obj.value(X)
+            # compute train RMSE
+            rmse = np.sqrt(2 * obj_val / mask_count)
+
             self.history.append((t, gap, obj_val))
             self.step_history.append(gamma)
             self.times.append(time.perf_counter() - t0)
+            self.weights_history.append(weights.copy())
             # reduced-memory snapshot
             self.snapshots.append(X.astype(self.snapshot_dtype, copy=False).copy())
-            self.weights_history.append(weights.copy())
             # prune near-zero atoms
             nz = [(a,w) for a,w in zip(atoms,weights) if w>1e-12]
             atoms, weights = map(list, zip(*nz)) if nz else ([], [])
 
-            if gap < self.tol: break
+            if gap < self.tol:
+                break
             if obj_val < best_obj - self.tol_obj:
                 best_obj, no_imp = obj_val, 0
             else:
                 no_imp += 1
-                if no_imp >= self.patience: break
+                if no_imp >= self.patience:
+                    break
+            # RMSE-based early stop
+            if abs(last_rmse - rmse) < 1e-4:
+                rmse_no_imp += 1
+                if rmse_no_imp >= self.patience:
+                    break
+            else:
+                last_rmse, rmse_no_imp = rmse, 0
+
         return X
