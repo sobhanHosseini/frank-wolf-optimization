@@ -4,6 +4,7 @@ import numpy as np
 import time
 from scipy.sparse import csr_matrix
 from scipy.sparse.linalg import svds
+from tqdm import trange
 
 # ----------------------------------------------------------------
 # Problem definition: sparse‐aware squared‐error objective
@@ -83,15 +84,14 @@ class FrankWolfe:
         fixed_gamma=0.1,
         snapshot_interval=10
     ):
-        print('test....')
-        self.obj        = objective
-        self.lmo        = lmo_fn
-        self.tau        = tau
-        self.max_iter   = max_iter
-        self.tol        = tol               # relative gap tolerance
-        self.step_method = step_method      # 'fixed','vanilla','analytic'
+        self.obj         = objective
+        self.lmo         = lmo_fn
+        self.tau         = tau
+        self.max_iter    = max_iter
+        self.tol         = tol               # relative gap tolerance
+        self.step_method = step_method       # 'fixed','vanilla','analytic'
         self.fixed_gamma = fixed_gamma
-        self.snap_int   = snapshot_interval
+        self.snap_int    = snapshot_interval
 
         # histories
         self.history         = []  # (iter, gap, obj)
@@ -113,14 +113,11 @@ class FrankWolfe:
         if self.step_method == 'vanilla':
             return 2.0 / (t + 2)
         # analytic exact line-search for quadratic loss
-        if self.step_method == 'analytic':
-            num = float(np.sum(grad.toarray() * d))
-            den = float(np.sum((d[self.obj.rows, self.obj.cols])**2))
-            if den <= 0:
-                return 2.0 / (t + 2)
-            return float(np.clip(-num / den, 0.0, 1.0))
-        # fallback to vanilla
-        return 2.0 / (t + 2)
+        num = float(np.sum(grad.toarray() * d))
+        den = float(np.sum((d[self.obj.rows, self.obj.cols])**2))
+        if den <= 0:
+            return 2.0 / (t + 2)
+        return float(np.clip(-num / den, 0.0, 1.0))
 
     def run(self, X0=None):
         X = np.zeros_like(self.obj.M_obs.toarray()) if X0 is None else X0.copy()
@@ -137,7 +134,7 @@ class FrankWolfe:
         self.snapshot_iters.append(0)
         self.times.append(0.0)
 
-        for t in range(1, self.max_iter + 1):
+        for t in trange(1, self.max_iter + 1, desc='Frank-Wolfe'):
             grad  = self.obj.gradient(X)
             atom  = self.lmo(grad, self.tau)
             S     = atom.to_matrix()
@@ -155,7 +152,7 @@ class FrankWolfe:
             gamma = self._choose_step(X, grad, S, d, t)
             self.step_history.append(gamma)
 
-            # curvature
+            # curvature estimate
             f0  = objv
             f1  = self.obj.value(X + gamma * d)
             num = f1 - f0 - gamma * np.sum(grad.toarray() * d)
@@ -173,7 +170,7 @@ class FrankWolfe:
 
 
 # ----------------------------------------------------------------
-# Pairwise Frank–Wolfe
+# Pairwise Frank–Wolfe variant, with progress bar
 # ----------------------------------------------------------------
 class PairwiseFrankWolfe(FrankWolfe):
     def run(self, X0=None):
@@ -197,17 +194,17 @@ class PairwiseFrankWolfe(FrankWolfe):
         self.gap_history.append(gap0)
         self.rel_gap_history.append(1.0)
 
-        for t in range(1, self.max_iter + 1):
+        for t in trange(1, self.max_iter + 1, desc='Pairwise-FW'):
             grad = self.obj.gradient(X)
             atom = self.lmo(grad, self.tau)
             if atom not in self.atoms:
                 self.atoms.append(atom); self.weights.append(0.0)
             idx_S = self.atoms.index(atom)
 
-            # away direction
-            scores   = [np.sum(grad.toarray() * a.to_matrix()) for a in self.atoms]
-            idx_away = int(np.argmax(scores))
-            alpha_max= self.weights[idx_away]
+            # choose away‐direction
+            scores    = [np.sum(grad.toarray() * a.to_matrix()) for a in self.atoms]
+            idx_away  = int(np.argmax(scores))
+            alpha_max = self.weights[idx_away]
 
             if alpha_max <= 0:
                 d = atom.to_matrix() - X
@@ -215,8 +212,8 @@ class PairwiseFrankWolfe(FrankWolfe):
                 V = self.atoms[idx_away].to_matrix()
                 d = atom.to_matrix() - V
 
-            gap   = self._dual_gap(X, grad, atom.to_matrix())
-            objv  = self.obj.value(X)
+            gap  = self._dual_gap(X, grad, atom.to_matrix())
+            objv = self.obj.value(X)
             self.history.append((t, gap, objv))
             self.gap_history.append(gap)
             self.rel_gap_history.append(gap / gap0)
@@ -229,20 +226,21 @@ class PairwiseFrankWolfe(FrankWolfe):
                 gamma = min(gamma, alpha_max)
             self.step_history.append(gamma)
 
-            # curvature
+            # curvature estimate
             f0  = objv
             f1  = self.obj.value(X + gamma * d)
             num = f1 - f0 - gamma * np.sum(grad.toarray() * d)
             curv= 2 * num / (gamma * gamma + 1e-16)
             self.curvature_hist.append(curv)
 
+            # update weights & X
             if alpha_max > 0:
                 self.weights[idx_away] -= gamma
             self.weights[idx_S] += gamma
             X += gamma * d
             self.times.append(time.perf_counter() - t0)
 
-            # prune atoms
+            # prune zero‐weights
             nz = [(a,w) for a,w in zip(self.atoms, self.weights) if w > 1e-12]
             if nz:
                 self.atoms, self.weights = zip(*nz)
