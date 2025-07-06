@@ -84,6 +84,7 @@ class FrankWolfe:
         fixed_gamma=0.1,
         snapshot_interval=10
     ):
+        print('test...')
         self.obj         = objective
         self.lmo         = lmo_fn
         self.tau         = tau
@@ -240,10 +241,10 @@ class PairwiseFrankWolfe(FrankWolfe):
             X += gamma * d
             self.times.append(time.perf_counter() - t0)
 
-            # prune zero‐weights
+            # prune zero‐weight atoms
             nz = [(a,w) for a,w in zip(self.atoms, self.weights) if w > 1e-12]
             if nz:
-                self.atoms, self.weights = zip(*nz)
+                self.atoms, self.weights = map(list, zip(*nz))
             else:
                 self.atoms, self.weights = [], []
 
