@@ -79,7 +79,7 @@ class FrankWolfe:
         snapshot_dtype: type = np.float32,
         snapshot_interval: int = 5
     ):
-        print("test....")
+        print("test...")
         self.obj               = objective
         self.lmo               = lmo_fn
         self.tau               = tau
