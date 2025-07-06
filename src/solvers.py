@@ -1,104 +1,103 @@
+# solvers.py
 import numpy as np
-from scipy.sparse.linalg import svds
-from tqdm import trange
 import time
+from scipy.sparse import csr_matrix
+from scipy.sparse.linalg import svds
 
 # ----------------------------------------------------------------
-# Problem definition and LMO
+# Problem definition and sparse‐aware LMO
 # ----------------------------------------------------------------
 class MatrixCompletionObjective:
-    def __init__(self, M_obs: np.ndarray, mask: np.ndarray):
+    def __init__(self, M_obs, mask):
         """
-        Half squared error on observed entries.
-        M_obs : observed entries (zeros elsewhere)
-        mask  : boolean mask of observed entries
+        M_obs : dense array OR scipy.sparse.csr_matrix of observed entries.
+        mask  : boolean mask same shape as M_obs (dense) indicating train entries.
         """
-        self.M_obs = M_obs
+        if not isinstance(M_obs, csr_matrix):
+            M_obs = csr_matrix(M_obs)
+        self.M_obs = M_obs.tocsr()
         self.mask  = mask
+        # store COO for quick indexing
+        coo      = self.M_obs.tocoo()
+        self.rows = coo.row
+        self.cols = coo.col
+        self.data = coo.data
 
-    def value(self, X: np.ndarray) -> float:
-        diff = (X - self.M_obs)[self.mask]
+    def value(self, X):
+        # f(X) = 0.5 * ||X_Ω - M_obs||_F^2
+        pred = X[self.rows, self.cols]
+        diff = pred - self.data
         return 0.5 * float(np.dot(diff, diff))
 
-    def gradient(self, X: np.ndarray) -> np.ndarray:
-        grad = np.zeros_like(X)
-        grad[self.mask] = (X - self.M_obs)[self.mask]
-        return grad
+    def gradient(self, X):
+        # grad_Ω = (X_Ω - M_obs), zero elsewhere
+        pred = X[self.rows, self.cols]
+        diff = pred - self.data
+        return csr_matrix((diff, (self.rows, self.cols)), shape=X.shape)
 
 # ----------------------------------------------------------------
-# Linear Minimization Oracle (nuclear-norm ball)
+# Nuclear‐norm‐ball LMO (handles sparse grads)
 # ----------------------------------------------------------------
-def nuclear_norm_lmo(grad: np.ndarray, tau: float):
+def nuclear_norm_lmo(grad, tau):
     """
-    Returns S = -tau * u1 v1^T solving min ⟨grad, Z⟩ s.t. ||Z||_* ≤ tau.
+    grad: can be dense or scipy.sparse matrix.
+    Returns best rank-1 atom S = -tau * u v^T.
     """
     try:
+        # svds handles sparse input
         u, s, vt = svds(grad, k=1, tol=1e-3, maxiter=200)
         if s[0] < 0:
-            raise RuntimeError("Non-positive singular value")
+            raise RuntimeError
+        u = u[:,0:1]; vt = vt[0:1,:]
     except Exception:
-        U, S, VT = np.linalg.svd(grad, full_matrices=False)
-        u, vt    = U[:, :1], VT[:1, :]
+        # fallback to dense SVD
+        G = grad.toarray() if hasattr(grad, "toarray") else np.array(grad)
+        U, S, VT = np.linalg.svd(G, full_matrices=False)
+        u, vt    = U[:,0:1], VT[0:1,:]
     return Atom(u, vt, tau)
 
-# ----------------------------------------------------------------
-# Rank-1 Atom container
-# ----------------------------------------------------------------
 class Atom:
-    def __init__(self, u: np.ndarray, v: np.ndarray, tau: float):
+    def __init__(self, u, v, tau):
         self.u   = u.reshape(-1,1)
         self.v   = v.reshape(1,-1)
         self.tau = tau
-
-    def to_matrix(self) -> np.ndarray:
+    def to_matrix(self):
         return -self.tau * (self.u @ self.v)
-
-    def __eq__(self, other):
-        return (
-            isinstance(other, Atom) and
-            np.allclose(self.u, other.u) and
-            np.allclose(self.v, other.v)
-        )
-
     def __repr__(self):
-        return f"Atom(tau={self.tau}, u_shape={self.u.shape}, v_shape={self.v.shape})"
+        return f"Atom(tau={self.tau:.3e}, u={self.u.shape}, v={self.v.shape})"
 
 # ----------------------------------------------------------------
-# Frank–Wolfe solver with relative-gap stopping and controlled snapshots
+# Frank–Wolfe with curvature & relative-gap stopping
 # ----------------------------------------------------------------
 class FrankWolfe:
     def __init__(
-        self,
-        objective,
-        lmo_fn,
-        tau: float = 1.0,
-        max_iter: int = 50,
-        tol: float = 1e-3,            # relative tolerance
-        step_method: str = 'vanilla',
-        fixed_gamma: float = 0.1,
-        snapshot_dtype: type = np.float32,
-        snapshot_interval: int = 5
+        self, objective, lmo_fn,
+        tau, max_iter=200, tol=1e-2,
+        snapshot_interval=10
     ):
-        self.obj               = objective
-        self.lmo               = lmo_fn
-        self.tau               = tau
-        self.max_iter          = max_iter
-        self.tol               = tol
-        self.step_method       = step_method
-        self.fixed_gamma       = fixed_gamma
-        self.snapshot_dtype    = snapshot_dtype
-        self.snapshot_interval = snapshot_interval
-        self.history           = []
-        self.times             = []
-        self.snapshots         = []
-        self.snapshot_iters    = []
-        self.step_history      = []
+        self.obj       = objective
+        self.lmo       = lmo_fn
+        self.tau       = tau
+        self.max_iter  = max_iter
+        self.tol       = tol
+        self.snap_int  = snapshot_interval
+
+        # histories
+        self.history          = []   # (iter, gap, obj_val)
+        self.gap_history      = []
+        self.rel_gap_history  = []
+        self.curvature_hist   = []
+        self.step_history     = []
+        self.snapshots        = []   # dense X copies at snapshots
+        self.snapshot_iters   = []
+        self.times            = []
 
     def _dual_gap(self, X, grad, S):
-        raw = -np.sum((S - X) * grad)
+        raw = -np.sum((S - X) * grad.toarray())
         return float(max(raw, 0.0))
 
     def _choose_step(self, X, grad, S, d, t):
+        # analytic exact line-minimizer for quadratic loss
         if self.step_method == 'fixed':
             return float(self.fixed_gamma)
         if self.step_method == 'vanilla':
@@ -109,110 +108,134 @@ class FrankWolfe:
             if den <= 0:
                 return 2.0/(t+2)
             return float(np.clip(-num/den, 0.0, 1.0))
-        if self.step_method == 'line_search':
-            alphas = np.linspace(0.0, 1.0, 20)
-            vals   = [self.obj.value(X + a*d) for a in alphas]
-            return float(alphas[np.argmin(vals)])
-        if self.step_method == 'armijo':
-            delta, beta = 0.5, 0.1
-            fk = self.obj.value(X)
-            gd = float(np.sum(grad * d))
-            alpha = 1.0
-            while alpha > 1e-8:
-                if self.obj.value(X + alpha*d) <= fk + beta*alpha*gd:
-                    return alpha
-                alpha *= delta
-            return 0.0
-        return 2.0/(t+2)
 
     def run(self, X0=None):
-        X = np.zeros_like(self.obj.M_obs) if X0 is None else X0.copy()
-        # initial snapshot
-        self.snapshots.append(X.astype(self.snapshot_dtype, copy=False).copy())
-        self.snapshot_iters.append(0)
+        # dense X for now
+        X = np.zeros_like(self.obj.M_obs.toarray()) if X0 is None else X0.copy()
         t0 = time.perf_counter()
-        self.times.append(0.0)
-        initial_gap = None
 
-        for t in trange(self.max_iter, desc='Frank-Wolfe'):
+        # initial grad & gap
+        grad    = self.obj.gradient(X)
+        first_at = self.lmo(grad, self.tau)
+        first_S  = first_at.to_matrix()
+        gap0    = self._dual_gap(X, grad, first_S)
+        self.gap_history.append(gap0)
+        self.rel_gap_history.append(1.0)
+        self.snapshots.append(X.copy())
+        self.snapshot_iters.append(0)
+        self.times.append(0.0)
+
+        for t in range(1, self.max_iter+1):
             grad = self.obj.gradient(X)
             atom = self.lmo(grad, self.tau)
             S    = atom.to_matrix()
             d    = S - X
+
             gap  = self._dual_gap(X, grad, S)
-            if initial_gap is None:
-                initial_gap = gap
-            # relative-gap stopping
-            if gap <= self.tol * initial_gap:
+            objv = self.obj.value(X)
+            self.history.append((t, gap, objv))
+            self.gap_history.append(gap)
+            self.rel_gap_history.append(gap/gap0)
+
+            if gap <= self.tol * gap0:
                 break
-            # choose and apply step
+
+            # analytic step
             gamma = self._choose_step(X, grad, S, d, t)
-            X    += gamma * d
-            # record
-            obj_val = self.obj.value(X)
-            self.history.append((t, gap, obj_val))
             self.step_history.append(gamma)
+
+            # curvature estimate
+            f0 = objv
+            f1 = self.obj.value(X + gamma*d)
+            num = f1 - f0 - gamma * np.sum(grad.toarray() * d)
+            curv = 2 * num / (gamma*gamma + 1e-16)
+            self.curvature_hist.append(curv)
+
+            X += gamma * d
             self.times.append(time.perf_counter() - t0)
-            # conditional snapshot
-            if (t+1) % self.snapshot_interval == 0 or t == self.max_iter-1:
-                self.snapshots.append(X.astype(self.snapshot_dtype, copy=False).copy())
-                self.snapshot_iters.append(t+1)
+
+            # snapshot every snap_int iterations
+            if t % self.snap_int == 0 or t==self.max_iter:
+                self.snapshots.append(X.copy())
+                self.snapshot_iters.append(t)
+
         return X
 
 # ----------------------------------------------------------------
-# Pairwise Frank–Wolfe with relative-gap stopping and controlled snapshots
+# Pairwise Frank–Wolfe inherits everything, plus weights tracking
 # ----------------------------------------------------------------
 class PairwiseFrankWolfe(FrankWolfe):
     def run(self, X0=None):
-        # initialize
-        X = np.zeros_like(self.obj.M_obs) if X0 is None else X0.copy()
-        self.snapshots      = [X.astype(self.snapshot_dtype, copy=False).copy()]
-        self.snapshot_iters = [0]
-        t0 = time.perf_counter()
-        self.times = [0.0]
-        self.history = []
-        self.step_history = []
-        self.weights_history = []
-        atoms, weights = [], []
-        initial_gap = None
+        # for simplicity we reuse FW’s dense X but with atom‐weights
+        X = np.zeros_like(self.obj.M_obs.toarray()) if X0 is None else X0.copy()
+        self.atoms, self.weights = [], []
+        self.snapshots, self.snapshot_iters = [X.copy()], [0]
+        self.gap_history = []; self.rel_gap_history = []
+        self.history, self.curvature_hist = [], []
+        self.step_history, self.times = [], [0.0]
 
-        for t in trange(self.max_iter, desc='Pairwise-FW'):
+        # initial gap
+        grad = self.obj.gradient(X)
+        atom = self.lmo(grad, self.tau)
+        gap0 = self._dual_gap(X, grad, atom.to_matrix())
+        self.gap_history.append(gap0)
+        self.rel_gap_history.append(1.0)
+        # start the clock
+        t0 = time.perf_counter()
+
+        for t in range(1, self.max_iter+1):
             grad = self.obj.gradient(X)
             atom = self.lmo(grad, self.tau)
-            if atom not in atoms:
-                atoms.append(atom)
-                weights.append(0.0)
-            idx_S = atoms.index(atom)
-            scores = [np.sum(grad * a.to_matrix()) for a in atoms]
+            if atom not in self.atoms:
+                self.atoms.append(atom); self.weights.append(0.0)
+            idx_S = self.atoms.index(atom)
+            scores = [np.sum(grad.toarray() * a.to_matrix()) for a in self.atoms]
             idx_away = int(np.argmax(scores))
-            alpha_max = weights[idx_away]
-            S = atom.to_matrix()
+            alpha_max = self.weights[idx_away]
+
             if alpha_max <= 0:
-                d     = S - X
-                gamma = self._choose_step(X, grad, S, d, t)
-                weights[idx_S] += gamma
+                d = atom.to_matrix() - X
             else:
-                V     = atoms[idx_away].to_matrix()
-                d     = S - V
-                gamma = min(self._choose_step(X, grad, S, d, t), alpha_max)
-                weights[idx_S]   += gamma
-                weights[idx_away] -= gamma
-            gap = self._dual_gap(X, grad, S)
-            if initial_gap is None:
-                initial_gap = gap
-            if gap <= self.tol * initial_gap:
+                V = self.atoms[idx_away].to_matrix()
+                d = atom.to_matrix() - V
+
+            # duality gap and record
+            gap = self._dual_gap(X, grad, atom.to_matrix())
+            objv = self.obj.value(X)
+            self.history.append((t, gap, objv))
+            self.gap_history.append(gap)
+            self.rel_gap_history.append(gap/gap0)
+            if gap <= self.tol * gap0:
                 break
-            X += gamma * d
-            obj_val = self.obj.value(X)
-            self.history.append((t, gap, obj_val))
+
+            # step-size
+            gamma = self._choose_step(X, grad, atom.to_matrix(), d, t)
+            gamma = min(gamma, alpha_max) if alpha_max>0 else gamma
             self.step_history.append(gamma)
-            self.weights_history.append(weights.copy())
+
+            # curvature
+            f0 = objv
+            f1 = self.obj.value(X + gamma*d)
+            num = f1 - f0 - gamma * np.sum(grad.toarray() * d)
+            curv = 2 * num / (gamma*gamma + 1e-16)
+            self.curvature_hist.append(curv)
+
+            # update weights & X
+            if alpha_max > 0 and alpha_max > 0:
+                self.weights[idx_away] -= gamma
+            self.weights[idx_S] += gamma
+            X += gamma * d
             self.times.append(time.perf_counter() - t0)
-            # snapshot
-            if (t+1) % self.snapshot_interval == 0 or t == self.max_iter-1:
-                self.snapshots.append(X.astype(self.snapshot_dtype, copy=False).copy())
-                self.snapshot_iters.append(t+1)
-            # prune atoms
-            nz = [(a, w) for a, w in zip(atoms, weights) if w > 1e-12]
-            atoms, weights = (list(x) for x in zip(*nz)) if nz else ([], [])
+
+            # cleanup zero‐weight atoms
+            nz = [(a,w) for a,w in zip(self.atoms,self.weights) if w>1e-12]
+            if not nz:
+                self.atoms, self.weights = [], []
+            else:
+                self.atoms, self.weights = zip(*nz)
+
+            if t % self.snap_int == 0 or t==self.max_iter:
+                self.snapshots.append(X.copy())
+                self.snapshot_iters.append(t)
+
         return X
