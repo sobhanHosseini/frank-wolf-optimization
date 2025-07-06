@@ -83,6 +83,7 @@ class FrankWolfe:
         fixed_gamma=0.1,
         snapshot_interval=10
     ):
+        print('test....')
         self.obj        = objective
         self.lmo        = lmo_fn
         self.tau        = tau
