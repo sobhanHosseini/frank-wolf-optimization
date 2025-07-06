@@ -73,55 +73,62 @@ class FrankWolfe:
         lmo_fn,
         tau: float = 1.0,
         max_iter: int = 50,
-        tol: float = 1e-3,            # now a relative tolerance
+        tol: float = 1e-3,            # relative tolerance
         step_method: str = 'vanilla',
         fixed_gamma: float = 0.1,
         snapshot_dtype: type = np.float32,
         snapshot_interval: int = 5
     ):
-        self.obj              = objective
-        self.lmo              = lmo_fn
-        self.tau              = tau
-        self.max_iter         = max_iter
-        self.tol              = tol
-        self.step_method      = step_method
-        self.fixed_gamma      = fixed_gamma
-        self.snapshot_dtype   = snapshot_dtype
+        self.obj               = objective
+        self.lmo               = lmo_fn
+        self.tau               = tau
+        self.max_iter          = max_iter
+        self.tol               = tol
+        self.step_method       = step_method
+        self.fixed_gamma       = fixed_gamma
+        self.snapshot_dtype    = snapshot_dtype
         self.snapshot_interval = snapshot_interval
-        self.history          = []
-        self.times            = []
-        self.snapshots        = []
-        self.snapshot_iters   = []
-        self.step_history     = []
+        self.history           = []
+        self.times             = []
+        self.snapshots         = []
+        self.snapshot_iters    = []
+        self.step_history      = []
 
     def _dual_gap(self, X, grad, S):
         raw = -np.sum((S - X) * grad)
         return float(max(raw, 0.0))
 
     def _choose_step(self, X, grad, S, d, t):
-        if self.step_method == 'fixed': return float(self.fixed_gamma)
-        if self.step_method == 'vanilla': return 2.0/(t+2)
+        if self.step_method == 'fixed':
+            return float(self.fixed_gamma)
+        if self.step_method == 'vanilla':
+            return 2.0/(t+2)
         if self.step_method == 'analytic':
             num = float(np.sum(grad * d))
             den = float(np.sum((d*self.obj.mask)**2))
-            if den <= 0: return 2.0/(t+2)
-            return float(np.clip(-num/den,0.0,1.0))
+            if den <= 0:
+                return 2.0/(t+2)
+            return float(np.clip(-num/den, 0.0, 1.0))
         if self.step_method == 'line_search':
-            alphas = np.linspace(0.0,1.0,20)
-            vals = [self.obj.value(X + a*d) for a in alphas]
+            alphas = np.linspace(0.0, 1.0, 20)
+            vals   = [self.obj.value(X + a*d) for a in alphas]
             return float(alphas[np.argmin(vals)])
         if self.step_method == 'armijo':
-            delta,beta=0.5,0.1; fk=self.obj.value(X)
-            gd=float(np.sum(grad*d)); alpha=1.0
-            while alpha>1e-8:
-                if self.obj.value(X+alpha*d)<=fk+beta*alpha*gd: return alpha
-                alpha*=delta
+            delta, beta = 0.5, 0.1
+            fk = self.obj.value(X)
+            gd = float(np.sum(grad * d))
+            alpha = 1.0
+            while alpha > 1e-8:
+                if self.obj.value(X + alpha*d) <= fk + beta*alpha*gd:
+                    return alpha
+                alpha *= delta
             return 0.0
         return 2.0/(t+2)
 
     def run(self, X0=None):
         X = np.zeros_like(self.obj.M_obs) if X0 is None else X0.copy()
-        self.snapshots.append(X.astype(self.snapshot_dtype,copy=False).copy())
+        # initial snapshot
+        self.snapshots.append(X.astype(self.snapshot_dtype, copy=False).copy())
         self.snapshot_iters.append(0)
         t0 = time.perf_counter()
         self.times.append(0.0)
@@ -130,21 +137,25 @@ class FrankWolfe:
         for t in trange(self.max_iter, desc='Frank-Wolfe'):
             grad = self.obj.gradient(X)
             atom = self.lmo(grad, self.tau)
-            S = atom.to_matrix()
-            d = S - X
-            gap = self._dual_gap(X, grad, S)
+            S    = atom.to_matrix()
+            d    = S - X
+            gap  = self._dual_gap(X, grad, S)
             if initial_gap is None:
                 initial_gap = gap
-            # relative gap stopping
+            # relative-gap stopping
             if gap <= self.tol * initial_gap:
                 break
-            X += self._choose_step(X, grad, S, d, t) * d
-            self.history.append((t, gap, self.obj.value(X)))
-            self.step_history.append(self.history[-1][1])
+            # choose and apply step
+            gamma = self._choose_step(X, grad, S, d, t)
+            X    += gamma * d
+            # record
+            obj_val = self.obj.value(X)
+            self.history.append((t, gap, obj_val))
+            self.step_history.append(gamma)
             self.times.append(time.perf_counter() - t0)
-            # snapshot
-            if (t+1)%self.snapshot_interval==0 or t==self.max_iter-1:
-                self.snapshots.append(X.astype(self.snapshot_dtype,copy=False).copy())
+            # conditional snapshot
+            if (t+1) % self.snapshot_interval == 0 or t == self.max_iter-1:
+                self.snapshots.append(X.astype(self.snapshot_dtype, copy=False).copy())
                 self.snapshot_iters.append(t+1)
         return X
 
@@ -153,50 +164,55 @@ class FrankWolfe:
 # ----------------------------------------------------------------
 class PairwiseFrankWolfe(FrankWolfe):
     def run(self, X0=None):
+        # initialize
         X = np.zeros_like(self.obj.M_obs) if X0 is None else X0.copy()
-        self.snapshots = [X.astype(self.snapshot_dtype,copy=False).copy()]
+        self.snapshots      = [X.astype(self.snapshot_dtype, copy=False).copy()]
         self.snapshot_iters = [0]
         t0 = time.perf_counter()
         self.times = [0.0]
         self.history = []
         self.step_history = []
         self.weights_history = []
-        atoms,weights = [],[]
+        atoms, weights = [], []
         initial_gap = None
 
         for t in trange(self.max_iter, desc='Pairwise-FW'):
             grad = self.obj.gradient(X)
             atom = self.lmo(grad, self.tau)
             if atom not in atoms:
-                atoms.append(atom); weights.append(0.0)
+                atoms.append(atom)
+                weights.append(0.0)
             idx_S = atoms.index(atom)
-            scores = [-a.tau * float(a.u.T @ grad @ a.v.T) for a in atoms]
+            scores = [np.sum(grad * a.to_matrix()) for a in atoms]
             idx_away = int(np.argmax(scores))
             alpha_max = weights[idx_away]
             S = atom.to_matrix()
             if alpha_max <= 0:
-                d = S - X
+                d     = S - X
                 gamma = self._choose_step(X, grad, S, d, t)
                 weights[idx_S] += gamma
             else:
-                V = atoms[idx_away].to_matrix()
-                d = S - V
+                V     = atoms[idx_away].to_matrix()
+                d     = S - V
                 gamma = min(self._choose_step(X, grad, S, d, t), alpha_max)
                 weights[idx_S]   += gamma
                 weights[idx_away] -= gamma
             gap = self._dual_gap(X, grad, S)
-            if initial_gap is None: initial_gap = gap
+            if initial_gap is None:
+                initial_gap = gap
             if gap <= self.tol * initial_gap:
                 break
             X += gamma * d
-            self.history.append((t, gap, self.obj.value(X)))
+            obj_val = self.obj.value(X)
+            self.history.append((t, gap, obj_val))
             self.step_history.append(gamma)
             self.weights_history.append(weights.copy())
             self.times.append(time.perf_counter() - t0)
-            if (t+1)%self.snapshot_interval==0 or t==self.max_iter-1:
-                self.snapshots.append(X.astype(self.snapshot_dtype,copy=False).copy())
+            # snapshot
+            if (t+1) % self.snapshot_interval == 0 or t == self.max_iter-1:
+                self.snapshots.append(X.astype(self.snapshot_dtype, copy=False).copy())
                 self.snapshot_iters.append(t+1)
-            # prune
-            nz = [(a,w) for a,w in zip(atoms,weights) if w>1e-12]
-            atoms,weights = map(list,zip(*nz)) if nz else ([],[])
+            # prune atoms
+            nz = [(a, w) for a, w in zip(atoms, weights) if w > 1e-12]
+            atoms, weights = (list(x) for x in zip(*nz)) if nz else ([], [])
         return X

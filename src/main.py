@@ -231,13 +231,12 @@ class ExperimentPlotter:
             plt.show(); plt.close(fig)
 
         # Combined summary table
-        if len(self.cfg['datasets'])>1:
-            print("\n=== Combined Summary ===")
-            hdr = f"{'Dataset':10s}{'Solver-Step':20s}{'RMSE_tr':>8s}{'RMSE_te':>8s}{'NRMSE_tr':>8s}{'NRMSE_te':>8s}{'R2_tr':>8s}{'R2_te':>8s}{'Iters':>6s}"
-            print(hdr)
-            print('-'*len(hdr))
-            for ds, sol, tr, te, nrtr, nrte, r2t, r2e, it in self.summary_rows:
-                print(f"{ds:10s}{sol:20s}{tr:8.4f}{te:8.4f}{nrtr:8.4f}{nrte:8.4f}{r2t:8.4f}{r2e:8.4f}{it:6d}")
+        print("\n=== Combined Summary ===")
+        hdr = f"{'Dataset':10s}{'Solver-Step':20s}{'RMSE_tr':>8s}{'RMSE_te':>8s}{'NRMSE_tr':>8s}{'NRMSE_te':>8s}{'R2_tr':>8s}{'R2_te':>8s}{'Iters':>6s}"
+        print(hdr)
+        print('-'*len(hdr))
+        for ds, sol, tr, te, nrtr, nrte, r2t, r2e, it in self.summary_rows:
+            print(f"{ds:10s}{sol:20s}{tr:8.4f}{te:8.4f}{nrtr:8.4f}{nrte:8.4f}{r2t:8.4f}{r2e:8.4f}{it:6d}")
 
 # ----------------------------------------------------------------------------
 # Main execution
