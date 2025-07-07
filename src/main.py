@@ -52,7 +52,7 @@ class ExperimentRunner:
     def run(self):
         for dataset in self.cfg['datasets']:
             print(f"\n=== Dataset: {dataset} ===")
-            # load data (M_obs, mask_train, mask_test, M_true)
+            # load data (M_obs sparse CSR, masks dense, M_true dense)
             M_obs, mask_train, mask_test, M_true = load_dataset(
                 name=dataset,
                 test_fraction=self.cfg['test_fraction'],
@@ -61,8 +61,9 @@ class ExperimentRunner:
 
             # center by training mean
             mu_tr = M_true[mask_train].mean()
+            # subtract mean from observed entries in sparse CSR
             M_obs_centered = M_obs.copy()
-            M_obs_centered[mask_train] -= mu_tr
+            M_obs_centered.data = M_obs_centered.data - mu_tr
 
             # dynamic rating range
             vals = M_true[mask_train]
@@ -92,24 +93,18 @@ class ExperimentRunner:
                         tau=tau,
                         max_iter=self.cfg['max_iter'],
                         tol=self.cfg['tol'],
-                        step_method=step,
                         snapshot_interval=self.cfg['snapshot_interval']
                     )
                     start = time.time()
                     solver.run()
                     duration = time.time() - start
 
-                    # true iteration count from history
                     n_iters = len(solver.history)
                     print(f"Finished {solver_name}-{step} in {duration:.1f}s, iters={n_iters}")
 
-                    # align snapshots to history: drop initial snapshot at t=0
-                    all_snaps      = solver.snapshots
-                    all_snap_iters = solver.snapshot_iters
-                    snaps     = all_snaps[1:n_iters+1]
-                    snap_iters = np.array(all_snap_iters[1:n_iters+1])
+                    snaps      = solver.snapshots[1:n_iters+1]
+                    snap_iters = np.array(solver.snapshot_iters[1:n_iters+1])
 
-                    # compute metrics per snapshot
                     rmse_tr = np.array([
                         np.sqrt(np.mean(((Xk + mu_tr)[mask_train] - M_true[mask_train])**2))
                         for Xk in snaps
@@ -118,15 +113,14 @@ class ExperimentRunner:
                         evaluate(M_true, Xk + mu_tr, mask_test)
                         for Xk in snaps
                     ])
-                    gaps     = np.array([h[1] for h in solver.history])
-                    obj_vals = np.array([h[2] for h in solver.history])
-                    times    = np.array(solver.times[1:n_iters+1])
-                    steps_h  = np.array(solver.step_history)[:n_iters]
-                    weights_hist = getattr(solver, 'weights_history', None)
-                    active_sizes = (
-                        np.array([len(w) for w in weights_hist])[:n_iters]
-                        if weights_hist is not None
-                        else np.zeros(n_iters, int)
+                    gaps      = np.array([h[1] for h in solver.history])
+                    obj_vals  = np.array([h[2] for h in solver.history])
+                    times     = np.array(solver.times[1:n_iters+1])
+                    steps_h   = np.array(solver.step_history)[:n_iters]
+                    weights_h = getattr(solver, 'weights_history', None)
+                    active_sz = (
+                        np.array([len(w) for w in weights_h])[:n_iters]
+                        if weights_h is not None else np.zeros(n_iters, int)
                     )
 
                     solver_map[step] = {
@@ -137,10 +131,9 @@ class ExperimentRunner:
                         'rmse_test':    rmse_te,
                         'times':        times,
                         'step_history': steps_h,
-                        'active_sizes': active_sizes,
+                        'active_sizes': active_sz,
                     }
 
-                    # summary row
                     final_tr, final_te = rmse_tr[-1], rmse_te[-1]
                     nrm_tr = final_tr / rating_range
                     nrm_te = final_te / rating_range
@@ -161,7 +154,7 @@ class ExperimentRunner:
 
 
 # ----------------------------------------------------------------------------
-# Plotter: visualizes diagnostics using aligned snap_iters
+# Plotter: visualizes diagnostics
 # ----------------------------------------------------------------------------
 class ExperimentPlotter:
     def __init__(self, results, summary_rows, cfg):
@@ -172,59 +165,50 @@ class ExperimentPlotter:
     def _plot_gap(self, ax, data):
         for sname, dd in data.items():
             for step, d in dd.items():
-                x = d['snap_iters']
-                y = d['gap']
-                idx = subsample_indices(len(x))
-                ax.loglog(x[idx], np.maximum(y[idx], 1e-16), label=f"{sname}-{step}")
+                idx = subsample_indices(len(d['snap_iters']))
+                ax.loglog(d['snap_iters'][idx], np.maximum(d['gap'][idx], 1e-16), label=f"{sname}-{step}")
         ax.set(title='Gap vs Iter', xlabel='Iteration', ylabel='Duality Gap')
         ax.legend(); ax.grid(True, which='both')
 
     def _plot_obj_vs_time(self, ax, data):
         for sname, dd in data.items():
             for step, d in dd.items():
-                x, y = d['times'], d['obj_vals']
-                idx = subsample_indices(len(x))
-                ax.plot(x[idx], y[idx], label=f"{sname}-{step}")
+                idx = subsample_indices(len(d['times']))
+                ax.plot(d['times'][idx], d['obj_vals'][idx], label=f"{sname}-{step}")
         ax.set(title='Obj vs Time', xlabel='Time (s)', ylabel='Objective')
         ax.legend(); ax.grid(True)
 
     def _plot_rmse_vs_iter(self, ax, data):
         for sname, dd in data.items():
             for step, d in dd.items():
-                x = d['snap_iters']
-                y_tr, y_te = d['rmse_train'], d['rmse_test']
-                idx = subsample_indices(len(x))
-                ax.plot(x[idx], y_tr[idx], '--', label=f"{sname}-{step}-train")
-                ax.plot(x[idx], y_te[idx],  '-', label=f"{sname}-{step}-test")
+                idx = subsample_indices(len(d['snap_iters']))
+                ax.plot(d['snap_iters'][idx], d['rmse_train'][idx], '--', label=f"{sname}-{step}-train")
+                ax.plot(d['snap_iters'][idx], d['rmse_test'][idx], '-',  label=f"{sname}-{step}-test")
         ax.set(title='RMSE vs Iter', xlabel='Iteration', ylabel='RMSE')
         ax.legend(); ax.grid(True)
 
     def _plot_active_set(self, ax, data):
-        for step, d in data.get('PFW', {}).items():
-            x, y = d['snap_iters'], d['active_sizes']
-            idx = subsample_indices(len(x))
-            ax.plot(x[idx], y[idx], '-o', label=step)
+        pf = data.get('PFW', {})
+        for step, d in pf.items():
+            idx = subsample_indices(len(d['active_sizes']))
+            ax.plot(d['snap_iters'][idx], d['active_sizes'][idx], '-o', label=step)
         ax.set(title='PFW Active-set Growth', xlabel='Iteration', ylabel='Active-set size')
         ax.legend(); ax.grid(True)
 
     def _plot_step_size(self, ax, data):
         for sname, dd in data.items():
             for step, d in dd.items():
-                x, y = d['snap_iters'], d['step_history']
-                idx = subsample_indices(len(x))
-                ax.plot(x[idx], y[idx], 'o-', label=f"{sname}-{step}")
+                idx = subsample_indices(len(d['step_history']))
+                ax.plot(d['snap_iters'][idx], d['step_history'][idx], 'o-', label=f"{sname}-{step}")
         ax.set(title='Step-size vs Iter', xlabel='Iteration', ylabel='Step-size γₖ')
         ax.set_yscale('log'); ax.legend(); ax.grid(True)
 
     def _plot_rmse_vs_rank(self, ax, data):
         for sname, dd in data.items():
             for step, d in dd.items():
-                if sname == 'PFW':
-                    ranks = d['active_sizes']
-                else:
-                    ranks = d['snap_iters']
+                ranks = d['active_sizes'] if sname=='PFW' else d['snap_iters']
                 idx = subsample_indices(len(ranks))
-                ax.plot(np.array(ranks)[idx], d['rmse_train'][idx], '-o', label=f"{sname}-{step}")
+                ax.plot(ranks[idx], d['rmse_train'][idx], '-o', label=f"{sname}-{step}")
         ax.set(title='Train RMSE vs Rank', xlabel='Rank', ylabel='Train RMSE')
         ax.legend(); ax.grid(True)
 

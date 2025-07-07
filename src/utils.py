@@ -1,73 +1,70 @@
+# utils.py
+
 import numpy as np
 import pandas as pd
-from scipy.sparse.linalg import svds
+from scipy import sparse
 
 # ----------------------------------------------------------------
-# Helper: approximate nuclear norm for faster tau estimation
+# Helper: approximate nuclear norm for faster τ estimation
 # ----------------------------------------------------------------
-def approximate_nuclear_norm(M: np.ndarray, k: int = 10, tol: float = 1e-3, maxiter: int = 200) -> float:
+def approximate_nuclear_norm(M: sparse.csr_matrix, k: int = 10,
+                             tol: float = 1e-3, maxiter: int = 200) -> float:
     """
-    Approximate the nuclear norm (trace norm) of M by summing its top-k singular values via svds.
+    Approximate the nuclear norm of M (sparse CSR) by summing top-k singular values.
     """
-    k = min(k, min(M.shape) - 1)
-    if k <= 0:
-        return float(np.linalg.norm(M, ord='nuc'))
+    # Convert to dense for fallback if needed
     try:
-        u, s, vt = svds(M, k=k, tol=tol, maxiter=maxiter)
+        u, s, vt = sparse.linalg.svds(M, k=min(k, min(M.shape)-1),
+                                      tol=tol, maxiter=maxiter)
         return float(np.sum(s))
     except Exception:
-        return float(np.linalg.norm(M, ord='nuc'))
+        return float(np.linalg.norm(M.toarray(), ord='nuc'))
 
 # ----------------------------------------------------------------
 # Train/test split utilities (only among observed entries)
 # ----------------------------------------------------------------
-def train_test_split_matrix(M_true: np.ndarray, test_fraction: float = 0.2, seed: int = 0):
+def train_test_split_matrix(M_true: np.ndarray, test_fraction: float = 0.2,
+                            seed: int = 0):
     """
-    Splits only over non-zero entries of M_true into train/test masks.
-    Returns: M_obs, mask_train, mask_test, M_true
+    Splits only on non-zero entries of M_true into train/test.
+    Returns M_obs (sparse CSR), mask_train, mask_test, M_true.
     """
     rng = np.random.RandomState(seed)
-    # find indices of observed entries
     ui, ij = np.nonzero(M_true)
-    n_obs = ui.size
-    # sample train/test on observed indices
+    n_obs  = ui.size
     train_flag = rng.rand(n_obs) < (1 - test_fraction)
+
     mask_train = np.zeros_like(M_true, dtype=bool)
     mask_test  = np.zeros_like(M_true, dtype=bool)
     mask_train[ui[train_flag], ij[train_flag]] = True
     mask_test[ui[~train_flag], ij[~train_flag]]  = True
-    # observed training matrix
-    M_obs = np.zeros_like(M_true)
-    M_obs[mask_train] = M_true[mask_train]
+
+    # Build sparse training matrix
+    data = M_true[mask_train]
+    obs_ui, obs_ij = np.where(mask_train)
+    M_obs = sparse.csr_matrix((data, (obs_ui, obs_ij)), shape=M_true.shape)
     return M_obs, mask_train, mask_test, M_true
 
 # ----------------------------------------------------------------
-# Loaders
+# Loaders for various datasets
 # ----------------------------------------------------------------
 def load_jester2(path="./data/jester2/jester_ratings.dat",
                  test_fraction=0.2, seed=0):
-    # read ratings
-    user_map = {}
-    item_map = {}
-    reviews  = []
+    user_map, item_map, reviews = {}, {}, []
     with open(path, 'r') as f:
         for line in f:
             u, i, r = line.split()
             user_map.setdefault(u, len(user_map))
             item_map.setdefault(i, len(item_map))
             reviews.append((u, i, float(r)))
-    n_users = len(user_map)
-    n_items = len(item_map)
-    # build full
+    n_users, n_items = len(user_map), len(item_map)
     M_true = np.zeros((n_users, n_items), dtype=float)
     for u, i, r in reviews:
         M_true[user_map[u], item_map[i]] = r
     return train_test_split_matrix(M_true, test_fraction, seed)
 
-
 def load_movielens100k(path="./data/ml-100k/u.data",
-                       test_fraction=0.2,
-                       seed=0):
+                       test_fraction=0.2, seed=0):
     df = pd.read_csv(path, sep="\t", names=["user","item","rating","ts"])
     n_u, n_i = df.user.max(), df.item.max()
     M_true = np.zeros((n_u, n_i), dtype=float)
@@ -75,10 +72,8 @@ def load_movielens100k(path="./data/ml-100k/u.data",
         M_true[u-1, i-1] = r
     return train_test_split_matrix(M_true, test_fraction, seed)
 
-
 def load_movielens1m(path="./data/ml-1m/ratings.dat",
-                     test_fraction=0.2,
-                     seed=0):
+                     test_fraction=0.2, seed=0):
     df = pd.read_csv(path, sep="::", engine="python",
                      names=["user","item","rating","_"])
     n_u, n_i = df.user.max(), df.item.max()
@@ -86,7 +81,6 @@ def load_movielens1m(path="./data/ml-1m/ratings.dat",
     for u,i,r in zip(df.user, df.item, df.rating):
         M_true[u-1, i-1] = r
     return train_test_split_matrix(M_true, test_fraction, seed)
-
 
 def load_dataset(name, **kwargs):
     if name == "ml-100k":
@@ -99,7 +93,7 @@ def load_dataset(name, **kwargs):
         raise ValueError(f"Unknown dataset '{name}'")
 
 # ----------------------------------------------------------------
-# Evaluation
+# Evaluation: RMSE over mask
 # ----------------------------------------------------------------
 def evaluate(M_true, X_pred, mask):
     diff = (X_pred - M_true)[mask]
