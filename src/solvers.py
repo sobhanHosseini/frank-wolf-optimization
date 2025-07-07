@@ -96,36 +96,45 @@ class FrankWolfe:
     def __init__(self, objective, lmo_function, tau=1.0, max_iter=50,
                  tol=1e-3, abs_tol=1e-6, snapshot_interval=5,
                  step_method='analytic', fixed_step=0.1):
-        self.objective       = objective
-        self.lmo_function    = lmo_function
-        self.tau             = tau
-        self.max_iter        = max_iter
-        self.tol             = tol
-        self.abs_tol         = abs_tol
+        print("test...")
+        self.objective         = objective
+        self.lmo_function      = lmo_function
+        self.tau               = tau
+        self.max_iter          = max_iter
+        self.tol               = tol
+        self.abs_tol           = abs_tol
         self.snapshot_interval = snapshot_interval
-        self.step_method     = step_method      # 'analytic', 'vanilla', or 'fixed'
-        self.fixed_step      = fixed_step
+        self.step_method       = step_method      # 'analytic', 'vanilla', or 'fixed'
+        self.fixed_step        = fixed_step
         # storage for atoms and their weights
-        self.atoms           = []   # list of Atom
-        self.weights         = []   # list of floats
+        self.atoms             = []   # list of Atom
+        self.weights           = []   # list of floats
         # diagnostics
-        self.history         = []
-        self.step_history    = []
-        self.times           = []
-        self.snapshots       = []
-        self.snapshot_iters  = []
+        self.history           = []   # (iter, gap, obj)
+        self.step_history      = []   # step sizes
+        self.times             = []   # elapsed time
+        self.snapshots         = []   # X_obs at snapshots
+        self.snapshot_iters    = []   # iteration numbers at snapshots
 
     def _reconstruct_X_obs(self):
-        mask    = self.objective.mask
-        X_obs   = np.zeros_like(self.objective.observed_matrix.toarray())
-        for weight, atom in zip(self.weights, self.atoms):
-            X_obs[mask] += weight * (atom.u @ atom.v.T)[mask]
+        # build current approximation only on the observed entries
+        mask  = self.objective.mask
+        # use M_obs (a csr_matrix) to get shape
+        X_obs = np.zeros_like(self.objective.M_obs.toarray())
+        for w, atom in zip(self.weights, self.atoms):
+            A = atom.u @ atom.v.T
+            X_obs[mask] += w * A[mask]
         return X_obs
 
     def _dual_gap(self, gradient, S_matrix):
-        gap_fw   = -gradient.multiply(S_matrix).sum()
-        gap_curr = sum(w * (-atom.to_matrix().multiply(gradient).sum())
-                       for w, atom in zip(self.weights, self.atoms))
+        # gap = -<S - X, grad> where X = sum w_i * atoms
+        # term for the FW direction
+        gap_fw = -gradient.multiply(S_matrix).sum()
+        # term for the current convex combination
+        gap_curr = sum(
+            w * (-atom.to_matrix().multiply(gradient).sum())
+            for w, atom in zip(self.weights, self.atoms)
+        )
         return float(max(gap_curr + gap_fw, 0.0))
 
     def _choose_step(self, gradient, direction, dir_norm_sq, iteration):
@@ -133,55 +142,60 @@ class FrankWolfe:
             return self.fixed_step
         if self.step_method == 'vanilla':
             return 2.0 / (iteration + 2)
-        # analytic for quadratic loss
-        numerator   = float(np.sum(gradient.multiply(direction)))
-        denominator = float(dir_norm_sq)
-        if denominator > 0:
-            return float(np.clip(-numerator / denominator, 0.0, 1.0))
+        # analytic for quadratic loss on observed entries
+        num = float(np.sum(gradient.multiply(direction)))
+        den = float(dir_norm_sq)
+        if den > 0:
+            return float(np.clip(-num / den, 0.0, 1.0))
         return 2.0 / (iteration + 2)
 
     def run(self):
-        start_time  = time.time()
-        X_obs       = self._reconstruct_X_obs()
+        start_time = time.time()
+        # initial approximation X_obs = 0
+        X_obs = self._reconstruct_X_obs()
         self.times.append(0.0)
         self.snapshots.append(X_obs.copy())
         self.snapshot_iters.append(0)
         initial_gap = None
 
         for t in trange(self.max_iter, desc='FW'):
-            X_obs    = self._reconstruct_X_obs()
-            gradient = self.objective.gradient(X_obs)
-            atom     = self.lmo_function(gradient, self.tau)
-            S_matrix = atom.to_matrix()
+            X_obs      = self._reconstruct_X_obs()
+            gradient   = self.objective.gradient(X_obs)
+            atom       = self.lmo_function(gradient, self.tau)
+            S_matrix   = atom.to_matrix()
 
-            direction    = S_matrix - X_obs
-            dir_norm_sq  = np.sum((direction * self.objective.mask)**2)
-            gap          = self._dual_gap(gradient, S_matrix)
+            direction   = S_matrix - X_obs
+            dir_norm_sq = np.sum((direction * self.objective.mask)**2)
+            gap         = self._dual_gap(gradient, S_matrix)
 
             if initial_gap is None:
                 initial_gap = gap
+            # stopping on relative or absolute gap
             if gap <= self.tol * initial_gap or gap <= self.abs_tol:
                 break
 
             step_size = self._choose_step(gradient, direction, dir_norm_sq, t)
 
+            # add new atom if needed
             if atom not in self.atoms:
                 self.atoms.append(atom)
                 self.weights.append(0.0)
             idx = self.atoms.index(atom)
             self.weights[idx] += step_size
 
-            self.history.append((t, gap, self.objective.value(X_obs)))
+            obj_val = self.objective.value(X_obs)
+            self.history.append((t, gap, obj_val))
             self.step_history.append(step_size)
             self.times.append(time.time() - start_time)
 
+            # snapshot logic
             if (t + 1) % self.snapshot_interval == 0 or t == self.max_iter - 1:
                 self.snapshots.append(self._reconstruct_X_obs())
                 self.snapshot_iters.append(t + 1)
 
-        # final snapshot
+        # final snapshot at termination
         self.snapshots.append(self._reconstruct_X_obs())
-        self.snapshot_iters.append(t + 1)
+        self.snapshot_iters.append(min(t + 1, self.max_iter))
         return None
 
 # ----------------------------------------------------------------
