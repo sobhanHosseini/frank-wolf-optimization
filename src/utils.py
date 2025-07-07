@@ -4,15 +4,8 @@ import numpy as np
 import pandas as pd
 from scipy import sparse
 
-# ----------------------------------------------------------------
-# Helper: approximate nuclear norm for faster τ estimation
-# ----------------------------------------------------------------
 def approximate_nuclear_norm(M: sparse.csr_matrix, k: int = 10,
                              tol: float = 1e-3, maxiter: int = 200) -> float:
-    """
-    Approximate the nuclear norm of M (sparse CSR) by summing top-k singular values.
-    """
-    # Convert to dense for fallback if needed
     try:
         u, s, vt = sparse.linalg.svds(M, k=min(k, min(M.shape)-1),
                                       tol=tol, maxiter=maxiter)
@@ -20,34 +13,22 @@ def approximate_nuclear_norm(M: sparse.csr_matrix, k: int = 10,
     except Exception:
         return float(np.linalg.norm(M.toarray(), ord='nuc'))
 
-# ----------------------------------------------------------------
-# Train/test split utilities (only among observed entries)
-# ----------------------------------------------------------------
 def train_test_split_matrix(M_true: np.ndarray, test_fraction: float = 0.2,
                             seed: int = 0):
-    """
-    Splits only on non-zero entries of M_true into train/test.
-    Returns M_obs (sparse CSR), mask_train, mask_test, M_true.
-    """
-    rng = np.random.RandomState(seed)
-    ui, ij = np.nonzero(M_true)
-    n_obs  = ui.size
-    train_flag = rng.rand(n_obs) < (1 - test_fraction)
+    rng    = np.random.RandomState(seed)
+    rows, cols = np.nonzero(M_true)
+    train_flag = rng.rand(rows.size) < (1 - test_fraction)
 
     mask_train = np.zeros_like(M_true, dtype=bool)
     mask_test  = np.zeros_like(M_true, dtype=bool)
-    mask_train[ui[train_flag], ij[train_flag]] = True
-    mask_test[ui[~train_flag], ij[~train_flag]]  = True
+    mask_train[rows[train_flag], cols[train_flag]] = True
+    mask_test[rows[~train_flag], cols[~train_flag]]  = True
 
-    # Build sparse training matrix
-    data = M_true[mask_train]
-    obs_ui, obs_ij = np.where(mask_train)
-    M_obs = sparse.csr_matrix((data, (obs_ui, obs_ij)), shape=M_true.shape)
+    data     = M_true[mask_train]
+    obs_rows, obs_cols = np.where(mask_train)
+    M_obs    = sparse.csr_matrix((data, (obs_rows, obs_cols)), shape=M_true.shape)
     return M_obs, mask_train, mask_test, M_true
 
-# ----------------------------------------------------------------
-# Loaders for various datasets
-# ----------------------------------------------------------------
 def load_jester2(path="./data/jester2/jester_ratings.dat",
                  test_fraction=0.2, seed=0):
     user_map, item_map, reviews = {}, {}, []
@@ -92,9 +73,6 @@ def load_dataset(name, **kwargs):
     else:
         raise ValueError(f"Unknown dataset '{name}'")
 
-# ----------------------------------------------------------------
-# Evaluation: RMSE over mask
-# ----------------------------------------------------------------
 def evaluate(M_true, X_pred, mask):
     diff = (X_pred - M_true)[mask]
     return np.sqrt(np.mean(diff**2)) if diff.size else 0.0
