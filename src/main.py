@@ -12,7 +12,6 @@ from solvers import (
     FrankWolfe,
     PairwiseFrankWolfe,
 )
-
 # ----------------------------------------------------------------------------
 # Configuration
 # ----------------------------------------------------------------------------
@@ -153,52 +152,87 @@ class ExperimentPlotter:
         self.cfg          = cfg
 
     def _plot_gap(self, ax, data):
-        for sname, dd in data.items():
+        for solver, dd in data.items():
             for step, d in dd.items():
-                idx = subsample_indices(len(d['snap_iters']))
-                ax.loglog(d['snap_iters'][idx], np.maximum(d['gap'][idx], 1e-16), label=f"{sname}-{step}")
+                x = np.array(d['snap_iters'])
+                y = np.array(d['gap'])
+                L = min(len(x), len(y))
+                x, y = x[:L], y[:L]
+                idx = subsample_indices(L)
+                ax.loglog(x[idx], np.maximum(y[idx], 1e-16), label=f"{solver}-{step}")
         ax.set(title='Gap vs Iter', xlabel='Iteration', ylabel='Duality Gap')
         ax.legend(); ax.grid(True, which='both')
 
     def _plot_obj_vs_time(self, ax, data):
-        for sname, dd in data.items():
+        for solver, dd in data.items():
             for step, d in dd.items():
-                idx = subsample_indices(len(d['times']))
-                ax.plot(d['times'][idx], d['obj_vals'][idx], label=f"{sname}-{step}")
+                x = np.array(d['times'])
+                y = np.array(d['obj_vals'])
+                L = min(len(x), len(y))
+                x, y = x[:L], y[:L]
+                idx = subsample_indices(L)
+                ax.plot(x[idx], y[idx], label=f"{solver}-{step}")
         ax.set(title='Obj vs Time', xlabel='Time (s)', ylabel='Objective')
         ax.legend(); ax.grid(True)
 
     def _plot_rmse_vs_iter(self, ax, data):
-        for sname, dd in data.items():
+        for solver, dd in data.items():
             for step, d in dd.items():
-                idx = subsample_indices(len(d['snap_iters']))
-                ax.plot(d['snap_iters'][idx], d['rmse_train'][idx], '--', label=f"{sname}-{step}-train")
-                ax.plot(d['snap_iters'][idx], d['rmse_test'][idx], '-',  label=f"{sname}-{step}-test")
+                x = np.array(d['snap_iters'])
+                y_tr = np.array(d['rmse_train'])
+                y_te = np.array(d['rmse_test'])
+                L = min(len(x), len(y_tr), len(y_te))
+                x, y_tr, y_te = x[:L], y_tr[:L], y_te[:L]
+                idx = subsample_indices(L)
+                ax.plot(x[idx], y_tr[idx], '--', label=f"{solver}-{step}-train")
+                ax.plot(x[idx], y_te[idx],  '-', label=f"{solver}-{step}-test")
         ax.set(title='RMSE vs Iter', xlabel='Iteration', ylabel='RMSE')
         ax.legend(); ax.grid(True)
 
     def _plot_active_set(self, ax, data):
         pf = data.get('PFW', {})
         for step, d in pf.items():
-            idx = subsample_indices(len(d['active_sizes']))
-            ax.plot(d['snap_iters'][idx], d['active_sizes'][idx], '-o', label=step)
+            x = np.array(d['snap_iters'])
+            y = np.array(d['active_sizes'])
+            L = min(len(x), len(y))
+            x, y = x[:L], y[:L]
+            if L == 0: 
+                continue
+            idx = subsample_indices(L)
+            ax.plot(x[idx], y[idx], '-o', label=step)
         ax.set(title='PFW Active-set Growth', xlabel='Iteration', ylabel='Active-set size')
         ax.legend(); ax.grid(True)
 
     def _plot_step_size(self, ax, data):
-        for sname, dd in data.items():
+        for solver, dd in data.items():
             for step, d in dd.items():
-                idx = subsample_indices(len(d['step_history']))
-                ax.plot(d['snap_iters'][idx], d['step_history'][idx], 'o-', label=f"{sname}-{step}")
-        ax.set(title='Step-size vs Iter', xlabel='Iteration', ylabel='Step-size γₖ')
+                # step_history length = n_iters, snap_iters length = n_iters+1
+                y = np.array(d['step_history'])
+                x = np.array(d['snap_iters'])[1:len(y)+1]
+                L = min(len(x), len(y))
+                x, y = x[:L], y[:L]
+                if L == 0:
+                    continue
+                idx = subsample_indices(L)
+                ax.plot(x[idx], y[idx], 'o-', label=f"{solver}-{step}")
+        ax.set(title='Step-size vs Iter', xlabel='Iteration', ylabel='Step-size γ')
         ax.set_yscale('log'); ax.legend(); ax.grid(True)
 
     def _plot_rmse_vs_rank(self, ax, data):
-        for sname, dd in data.items():
+        for solver, dd in data.items():
             for step, d in dd.items():
-                ranks = d['active_sizes'] if sname=='PFW' else d['snap_iters']
-                idx = subsample_indices(len(ranks))
-                ax.plot(ranks[idx], d['rmse_train'][idx], '-o', label=f"{sname}-{step}")
+                y = np.array(d['rmse_train'])
+                if solver == 'PFW':
+                    x_full = np.array(d['active_sizes'])
+                else:
+                    # for FW, rank = iteration number = snap_iters
+                    x_full = np.array(d['snap_iters'])
+                L = min(len(x_full), len(y))
+                x, y = x_full[:L], y[:L]
+                if L == 0:
+                    continue
+                idx = subsample_indices(L)
+                ax.plot(x[idx], y[idx], '-o', label=f"{solver}-{step}")
         ax.set(title='Train RMSE vs Rank', xlabel='Rank', ylabel='Train RMSE')
         ax.legend(); ax.grid(True)
 
@@ -219,9 +253,12 @@ class ExperimentPlotter:
             plt.tight_layout()
             plt.suptitle(f"Diagnostics {dataset}", y=1.02)
             if self.cfg['save_plots']:
+                os.makedirs(self.cfg['plot_dir'], exist_ok=True)
                 plt.savefig(os.path.join(self.cfg['plot_dir'], f"{dataset}_diagnostics.png"))
-            plt.show(); plt.close(fig)
+            plt.show()
+            plt.close(fig)
 
+        # Combined summary
         print("\n=== Combined Summary ===")
         hdr = (
             f"{'Dataset':10s}{'Solver-Step':20s}"
@@ -236,6 +273,7 @@ class ExperimentPlotter:
                   f"{tr:8.4f}{te:8.4f}"
                   f"{nrtr:8.4f}{nrte:8.4f}"
                   f"{r2t:8.4f}{r2e:8.4f}{it:6d}")
+
 
 
 if __name__ == '__main__':

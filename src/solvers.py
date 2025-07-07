@@ -112,15 +112,23 @@ class FrankWolfe:
     def _reconstruct_X_obs(self):
         mask  = self.objective.mask
         X_obs = np.zeros_like(self.objective.observed_matrix.toarray())
-        for w, atom in zip(self.weights, self.atoms):
-            X_obs[mask] += w * (atom.u @ atom.v.T)[mask]
+        for weight, atom in zip(self.weights, self.atoms):
+            X_obs[mask] += weight * (atom.u @ atom.v)[mask]
         return X_obs
 
     def _dual_gap(self, gradient, S_matrix):
-        gap_fw   = -gradient.multiply(S_matrix).sum()
-        gap_curr = sum(w * (-atom.to_matrix().multiply(gradient).sum())
-                       for w, atom in zip(self.weights, self.atoms))
+        # Dual gap: ⟨X−S, ∇f(X)⟩ = gap_curr + gap_fw
+        # Convert sparse gradient to dense for elementwise ops
+        grad_dense = gradient.toarray()
+        # Frank–Wolfe direction gap component
+        gap_fw = -np.sum(grad_dense * S_matrix)
+        # Current X contribution
+        gap_curr = 0.0
+        for weight, atom in zip(self.weights, self.atoms):
+            A = atom.to_matrix()
+            gap_curr += weight * (-np.sum(A * grad_dense))
         return float(max(gap_curr + gap_fw, 0.0))
+
 
     def _choose_step(self, gradient, direction, dir_norm_sq, iteration):
         if self.step_method == 'fixed':
