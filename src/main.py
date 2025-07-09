@@ -1,5 +1,3 @@
-# main.py
-
 import os
 import time
 import numpy as np
@@ -12,6 +10,7 @@ from solvers import (
     FrankWolfe,
     PairwiseFrankWolfe,
 )
+
 # ----------------------------------------------------------------------------
 # Configuration
 # ----------------------------------------------------------------------------
@@ -22,7 +21,7 @@ config = {
     'seed':               42,
     'tau_scale':          1.0,
     'max_iter':           200,
-    'tol':                1e-2,      # relative duality-gap tolerance
+    'tol':                1e-2,
     'snapshot_interval':  5,
     'save_plots':         False,
     'plot_dir':           'plots',
@@ -60,18 +59,21 @@ class ExperimentRunner:
 
             vals = M_true[mask_train]
             rating_range = float(vals.max() - vals.min())
-
             y_tr   = M_true[mask_train] - mu_tr
             y_te   = M_true[mask_test]  - mu_tr
             SST_tr = np.sum(y_tr**2)
             SST_te = np.sum(y_te**2)
 
             obj     = MatrixCompletionObjective(M_obs_centered, mask_train)
-            def_tau = approximate_nuclear_norm(M_obs_centered, k=self.cfg['tau_approx_k'])
+            def_tau = approximate_nuclear_norm(
+                M_obs_centered, k=self.cfg['tau_approx_k']
+            )
             tau     = self.cfg['tau_scale'] * def_tau
             print(f"μ_train={mu_tr:.3f}, τ≈{def_tau:.3f} → using τ={tau:.3f}")
 
             ds_results = {}
+
+            # *** FIXED: use solver_name as key, not dataset ***
             for solver_name, Solver in [('FW', FrankWolfe), ('PFW', PairwiseFrankWolfe)]:
                 solver_map = {}
                 for step in self.cfg['steps']:
@@ -91,32 +93,29 @@ class ExperimentRunner:
                     solver.run()
                     duration = time.time() - start
 
-                    n_iters = len(solver.history)
-                    print(f"Finished {solver_name}-{step} in {duration:.1f}s, iters={n_iters}")
+                    n_iters = len(solver.weights_history)
+                    print(f"Finished {solver_name}-{step} "
+                          f"in {duration:.1f}s, iters={n_iters}")
 
-                    snaps      = solver.snapshots[1:n_iters+1]
-                    snap_iters = np.array(solver.snapshot_iters[1:n_iters+1])
+                    # Reconstruct full X_k and compute RMSE
+                    rmse_tr = np.zeros(n_iters)
+                    rmse_te = np.zeros(n_iters)
+                    for i, ws in enumerate(solver.weights_history):
+                        Xk = sum(w * atom.to_matrix()
+                                 for w, atom in zip(ws, solver.atoms))
+                        Xk_full = Xk + mu_tr
+                        rmse_tr[i] = evaluate(M_true, Xk_full, mask_train)
+                        rmse_te[i] = evaluate(M_true, Xk_full, mask_test)
 
-                    rmse_tr = np.array([
-                        np.sqrt(np.mean(((Xk + mu_tr)[mask_train] - M_true[mask_train])**2))
-                        for Xk in snaps
-                    ])
-                    rmse_te = np.array([
-                        evaluate(M_true, Xk + mu_tr, mask_test)
-                        for Xk in snaps
-                    ])
-                    gaps      = np.array([h[1] for h in solver.history])
-                    obj_vals  = np.array([h[2] for h in solver.history])
-                    times     = np.array(solver.times[1:n_iters+1])
-                    steps_h   = np.array(solver.step_history)[:n_iters]
-                    weights_h = getattr(solver, 'weights_history', None)
-                    active_sz = (
-                        np.array([len(w) for w in weights_h])[:n_iters]
-                        if weights_h is not None else np.zeros(n_iters, int)
-                    )
+                    gaps     = np.array([h[1] for h in solver.history])
+                    obj_vals = np.array([h[2] for h in solver.history])
+                    times    = np.array(solver.times[1:n_iters+1])
+                    steps_h  = np.array(solver.step_history)[:n_iters]
+                    active_sz= np.array([len(ws) 
+                                         for ws in solver.weights_history])
 
                     solver_map[step] = {
-                        'snap_iters':   snap_iters,
+                        'snap_iters':   np.arange(1, n_iters+1),
                         'gap':          gaps,
                         'obj_vals':     obj_vals,
                         'rmse_train':   rmse_tr,
@@ -126,6 +125,7 @@ class ExperimentRunner:
                         'active_sizes': active_sz,
                     }
 
+                    # summary metrics
                     final_tr, final_te = rmse_tr[-1], rmse_te[-1]
                     nrm_tr = final_tr / rating_range
                     nrm_te = final_te / rating_range
@@ -139,7 +139,8 @@ class ExperimentRunner:
                          n_iters)
                     )
 
-                ds_results[solver_name] = solver_map
+                ds_results[solver_name] = solver_map   # ← correct key here
+
             self.results[dataset] = ds_results
 
         return self.results, self.summary_rows
