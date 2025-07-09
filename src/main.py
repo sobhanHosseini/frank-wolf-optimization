@@ -12,140 +12,144 @@ from solvers import (
 )
 
 # ----------------------------------------------------------------------------
-# Configuration: datasets and step rules
+# Configuration
 # ----------------------------------------------------------------------------
 config = {
-    'datasets':           ['ml-100k'],
+    'datasets':           ['jester2'],
     'steps':              ['analytic'],
     'test_fraction':      0.2,
     'seed':               42,
     'tau_scale':          1.0,
     'max_iter':           200,
-    'tol':                1e-2,      # relative duality-gap tolerance
+    'tol':                1e-2,
     'snapshot_interval':  5,
     'save_plots':         False,
     'plot_dir':           'plots',
     'tau_approx_k':       10,
+    'fixed_step':         0.1,
 }
 if config['save_plots']:
     os.makedirs(config['plot_dir'], exist_ok=True)
 
 
-# ----------------------------------------------------------------------------
-# Utility: subsample indices for plotting
-# ----------------------------------------------------------------------------
 def subsample_indices(n, num=20):
     if n <= num:
         return np.arange(n)
     return np.unique(np.linspace(0, n - 1, num, dtype=int))
 
 
-# ----------------------------------------------------------------------------
-# Experiment runner: executes solvers and collects metrics
-# ----------------------------------------------------------------------------
 class ExperimentRunner:
     def __init__(self, cfg):
         self.cfg          = cfg
-        self.results      = {}       # results[dataset][solver][step]
-        self.summary_rows = []       # (dataset, solver-step, ..., iters)
+        self.results      = {}
+        self.summary_rows = []
 
     def run(self):
         for dataset in self.cfg['datasets']:
             print(f"\n=== Dataset: {dataset} ===")
-            # load data (M_obs, mask_train, mask_test, M_true)
             M_obs, mask_train, mask_test, M_true = load_dataset(
                 name=dataset,
                 test_fraction=self.cfg['test_fraction'],
                 seed=self.cfg['seed']
             )
 
-            # center by training mean
             mu_tr = M_true[mask_train].mean()
             M_obs_centered = M_obs.copy()
-            M_obs_centered[mask_train] -= mu_tr
+            M_obs_centered.data -= mu_tr
 
-            # dynamic rating range
             vals = M_true[mask_train]
-            rmin, rmax = float(vals.min()), float(vals.max())
-            rating_range = rmax - rmin
-
-            # precompute sums of squares for R²
+            rating_range = float(vals.max() - vals.min())
             y_tr   = M_true[mask_train] - mu_tr
             y_te   = M_true[mask_test]  - mu_tr
-            SST_tr = (y_tr**2).sum()
-            SST_te = (y_te**2).sum()
+            SST_tr = np.sum(y_tr**2)
+            SST_te = np.sum(y_te**2)
 
-            # setup objective and τ
             obj     = MatrixCompletionObjective(M_obs_centered, mask_train)
-            def_tau = approximate_nuclear_norm(M_obs_centered, k=self.cfg['tau_approx_k'])
+            def_tau = approximate_nuclear_norm(
+                M_obs_centered, k=self.cfg['tau_approx_k']
+            )
             tau     = self.cfg['tau_scale'] * def_tau
             print(f"μ_train={mu_tr:.3f}, τ≈{def_tau:.3f} → using τ={tau:.3f}")
 
             ds_results = {}
+
             for solver_name, Solver in [('FW', FrankWolfe), ('PFW', PairwiseFrankWolfe)]:
                 solver_map = {}
                 for step in self.cfg['steps']:
                     print(f"--- {solver_name}-{step} ---")
                     solver = Solver(
                         objective=obj,
-                        lmo_fn=nuclear_norm_lmo,
+                        lmo_function=nuclear_norm_lmo,
                         tau=tau,
                         max_iter=self.cfg['max_iter'],
                         tol=self.cfg['tol'],
+                        abs_tol=1e-6,
+                        snapshot_interval=self.cfg['snapshot_interval'],
                         step_method=step,
-                        snapshot_interval=self.cfg['snapshot_interval']
+                        fixed_step=self.cfg['fixed_step']
                     )
                     start = time.time()
                     solver.run()
                     duration = time.time() - start
 
-                    # true iteration count from history
-                    n_iters = len(solver.history)
-                    print(f"Finished {solver_name}-{step} in {duration:.1f}s, iters={n_iters}")
+                    n_iters = len(solver.weights_history)
+                    print(f"Finished {solver_name}-{step} "
+                          f"in {duration:.1f}s, iters={n_iters}")
 
-                    # align snapshots to history: drop initial snapshot at t=0
-                    all_snaps      = solver.snapshots
-                    all_snap_iters = solver.snapshot_iters
-                    snaps     = all_snaps[1:n_iters+1]
-                    snap_iters = np.array(all_snap_iters[1:n_iters+1])
+                    # -------------------------------------------------
+                    # Fast vectorized RMSE on observed entries
+                    # -------------------------------------------------
+                    # 1) extract positions and centered targets
+                    rows_tr, cols_tr = np.where(mask_train)
+                    rows_te, cols_te = np.where(mask_test)
+                    y_tr = M_true[rows_tr, cols_tr] - mu_tr
+                    y_te = M_true[rows_te, cols_te] - mu_tr
 
-                    # compute metrics per snapshot
-                    rmse_tr = np.array([
-                        np.sqrt(np.mean(((Xk + mu_tr)[mask_train] - M_true[mask_train])**2))
-                        for Xk in snaps
-                    ])
-                    rmse_te = np.array([
-                        evaluate(M_true, Xk + mu_tr, mask_test)
-                        for Xk in snaps
-                    ])
+                    # 2) stack atoms
+                    R_final = len(solver.atoms)
+                    U = np.vstack([atom.u.ravel() for atom in solver.atoms])   # (R_final, m)
+                    V = np.vstack([atom.v.ravel() for atom in solver.atoms])   # (R_final, n)
+                    T = np.array([atom.tau for atom in solver.atoms])[:, None] # (R_final,1)
+
+                    # 3) per-atom predictions on observed entries
+                    A_tr = -T * (U[:, rows_tr] * V[:, cols_tr])  # (R_final, N_tr)
+                    A_te = -T * (U[:, rows_te] * V[:, cols_te])  # (R_final, N_te)
+
+                    # 4) build weight matrix with padding
+                    W = np.zeros((n_iters, R_final))             # (iters, R_final)
+                    for i, ws in enumerate(solver.weights_history):
+                        W[i, :len(ws)] = ws
+
+                    P_tr = W @ A_tr                              # (iters, N_tr)
+                    P_te = W @ A_te                              # (iters, N_te)
+
+                    rmse_tr = np.sqrt(((P_tr - y_tr[None, :])**2).mean(axis=1))
+                    rmse_te = np.sqrt(((P_te - y_te[None, :])**2).mean(axis=1))
+
+                    # other diagnostics
                     gaps     = np.array([h[1] for h in solver.history])
                     obj_vals = np.array([h[2] for h in solver.history])
                     times    = np.array(solver.times[1:n_iters+1])
                     steps_h  = np.array(solver.step_history)[:n_iters]
-                    weights_hist = getattr(solver, 'weights_history', None)
-                    active_sizes = (
-                        np.array([len(w) for w in weights_hist])[:n_iters]
-                        if weights_hist is not None
-                        else np.zeros(n_iters, int)
-                    )
+                    active_sz= np.array([len(ws) for ws in solver.weights_history])
 
                     solver_map[step] = {
-                        'snap_iters':   snap_iters,
+                        'snap_iters':   np.arange(1, n_iters+1),
                         'gap':          gaps,
                         'obj_vals':     obj_vals,
                         'rmse_train':   rmse_tr,
                         'rmse_test':    rmse_te,
                         'times':        times,
                         'step_history': steps_h,
-                        'active_sizes': active_sizes,
+                        'active_sizes': active_sz,
                     }
 
-                    # summary row
+                    # summary
                     final_tr, final_te = rmse_tr[-1], rmse_te[-1]
                     nrm_tr = final_tr / rating_range
                     nrm_te = final_te / rating_range
-                    R2_tr = 1 - ((final_tr**2 * mask_train.sum()) / SST_tr)
-                    R2_te = 1 - ((final_te**2 * mask_test.sum())  / SST_te)
+                    R2_tr = 1 - (final_tr**2 * mask_train.sum() / SST_tr)
+                    R2_te = 1 - (final_te**2 * mask_test.sum()   / SST_te)
                     self.summary_rows.append(
                         (dataset, f"{solver_name}-{step}",
                          final_tr, final_te,
@@ -155,14 +159,12 @@ class ExperimentRunner:
                     )
 
                 ds_results[solver_name] = solver_map
+
             self.results[dataset] = ds_results
 
         return self.results, self.summary_rows
 
 
-# ----------------------------------------------------------------------------
-# Plotter: visualizes diagnostics using aligned snap_iters
-# ----------------------------------------------------------------------------
 class ExperimentPlotter:
     def __init__(self, results, summary_rows, cfg):
         self.results      = results
@@ -170,61 +172,87 @@ class ExperimentPlotter:
         self.cfg          = cfg
 
     def _plot_gap(self, ax, data):
-        for sname, dd in data.items():
+        for solver, dd in data.items():
             for step, d in dd.items():
-                x = d['snap_iters']
-                y = d['gap']
-                idx = subsample_indices(len(x))
-                ax.loglog(x[idx], np.maximum(y[idx], 1e-16), label=f"{sname}-{step}")
+                x = np.array(d['snap_iters'])
+                y = np.array(d['gap'])
+                L = min(len(x), len(y))
+                x, y = x[:L], y[:L]
+                idx = subsample_indices(L)
+                ax.loglog(x[idx], np.maximum(y[idx], 1e-16), label=f"{solver}-{step}")
         ax.set(title='Gap vs Iter', xlabel='Iteration', ylabel='Duality Gap')
         ax.legend(); ax.grid(True, which='both')
 
     def _plot_obj_vs_time(self, ax, data):
-        for sname, dd in data.items():
+        for solver, dd in data.items():
             for step, d in dd.items():
-                x, y = d['times'], d['obj_vals']
-                idx = subsample_indices(len(x))
-                ax.plot(x[idx], y[idx], label=f"{sname}-{step}")
+                x = np.array(d['times'])
+                y = np.array(d['obj_vals'])
+                L = min(len(x), len(y))
+                x, y = x[:L], y[:L]
+                idx = subsample_indices(L)
+                ax.plot(x[idx], y[idx], label=f"{solver}-{step}")
         ax.set(title='Obj vs Time', xlabel='Time (s)', ylabel='Objective')
         ax.legend(); ax.grid(True)
 
     def _plot_rmse_vs_iter(self, ax, data):
-        for sname, dd in data.items():
+        for solver, dd in data.items():
             for step, d in dd.items():
-                x = d['snap_iters']
-                y_tr, y_te = d['rmse_train'], d['rmse_test']
-                idx = subsample_indices(len(x))
-                ax.plot(x[idx], y_tr[idx], '--', label=f"{sname}-{step}-train")
-                ax.plot(x[idx], y_te[idx],  '-', label=f"{sname}-{step}-test")
+                x = np.array(d['snap_iters'])
+                y_tr = np.array(d['rmse_train'])
+                y_te = np.array(d['rmse_test'])
+                L = min(len(x), len(y_tr), len(y_te))
+                x, y_tr, y_te = x[:L], y_tr[:L], y_te[:L]
+                idx = subsample_indices(L)
+                ax.plot(x[idx], y_tr[idx], '--', label=f"{solver}-{step}-train")
+                ax.plot(x[idx], y_te[idx],  '-', label=f"{solver}-{step}-test")
         ax.set(title='RMSE vs Iter', xlabel='Iteration', ylabel='RMSE')
         ax.legend(); ax.grid(True)
 
     def _plot_active_set(self, ax, data):
-        for step, d in data.get('PFW', {}).items():
-            x, y = d['snap_iters'], d['active_sizes']
-            idx = subsample_indices(len(x))
+        pf = data.get('PFW', {})
+        for step, d in pf.items():
+            x = np.array(d['snap_iters'])
+            y = np.array(d['active_sizes'])
+            L = min(len(x), len(y))
+            x, y = x[:L], y[:L]
+            if L == 0: 
+                continue
+            idx = subsample_indices(L)
             ax.plot(x[idx], y[idx], '-o', label=step)
         ax.set(title='PFW Active-set Growth', xlabel='Iteration', ylabel='Active-set size')
         ax.legend(); ax.grid(True)
 
     def _plot_step_size(self, ax, data):
-        for sname, dd in data.items():
+        for solver, dd in data.items():
             for step, d in dd.items():
-                x, y = d['snap_iters'], d['step_history']
-                idx = subsample_indices(len(x))
-                ax.plot(x[idx], y[idx], 'o-', label=f"{sname}-{step}")
-        ax.set(title='Step-size vs Iter', xlabel='Iteration', ylabel='Step-size γₖ')
+                # step_history length = n_iters, snap_iters length = n_iters+1
+                y = np.array(d['step_history'])
+                x = np.array(d['snap_iters'])[1:len(y)+1]
+                L = min(len(x), len(y))
+                x, y = x[:L], y[:L]
+                if L == 0:
+                    continue
+                idx = subsample_indices(L)
+                ax.plot(x[idx], y[idx], 'o-', label=f"{solver}-{step}")
+        ax.set(title='Step-size vs Iter', xlabel='Iteration', ylabel='Step-size γ')
         ax.set_yscale('log'); ax.legend(); ax.grid(True)
 
     def _plot_rmse_vs_rank(self, ax, data):
-        for sname, dd in data.items():
+        for solver, dd in data.items():
             for step, d in dd.items():
-                if sname == 'PFW':
-                    ranks = d['active_sizes']
+                y = np.array(d['rmse_train'])
+                if solver == 'PFW':
+                    x_full = np.array(d['active_sizes'])
                 else:
-                    ranks = d['snap_iters']
-                idx = subsample_indices(len(ranks))
-                ax.plot(np.array(ranks)[idx], d['rmse_train'][idx], '-o', label=f"{sname}-{step}")
+                    # for FW, rank = iteration number = snap_iters
+                    x_full = np.array(d['snap_iters'])
+                L = min(len(x_full), len(y))
+                x, y = x_full[:L], y[:L]
+                if L == 0:
+                    continue
+                idx = subsample_indices(L)
+                ax.plot(x[idx], y[idx], '-o', label=f"{solver}-{step}")
         ax.set(title='Train RMSE vs Rank', xlabel='Rank', ylabel='Train RMSE')
         ax.legend(); ax.grid(True)
 
@@ -245,10 +273,12 @@ class ExperimentPlotter:
             plt.tight_layout()
             plt.suptitle(f"Diagnostics {dataset}", y=1.02)
             if self.cfg['save_plots']:
+                os.makedirs(self.cfg['plot_dir'], exist_ok=True)
                 plt.savefig(os.path.join(self.cfg['plot_dir'], f"{dataset}_diagnostics.png"))
-            plt.show(); plt.close(fig)
+            plt.show()
+            plt.close(fig)
 
-        # Combined summary table
+        # Combined summary
         print("\n=== Combined Summary ===")
         hdr = (
             f"{'Dataset':10s}{'Solver-Step':20s}"
@@ -265,11 +295,9 @@ class ExperimentPlotter:
                   f"{r2t:8.4f}{r2e:8.4f}{it:6d}")
 
 
-# ----------------------------------------------------------------------------
-# Main execution
-# ----------------------------------------------------------------------------
+
 if __name__ == '__main__':
-    runner        = ExperimentRunner(config)
+    runner = ExperimentRunner(config)
     results, summary_rows = runner.run()
-    plotter       = ExperimentPlotter(results, summary_rows, config)
+    plotter = ExperimentPlotter(results, summary_rows, config)
     plotter.plot()
