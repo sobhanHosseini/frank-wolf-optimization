@@ -29,7 +29,7 @@ def train_test_split_matrix(M_true: np.ndarray, test_fraction: float = 0.2,
     M_obs    = sparse.csr_matrix((data, (obs_rows, obs_cols)), shape=M_true.shape)
     return M_obs, mask_train, mask_test, M_true
 
-def load_jester2(path="./data/jester2/jester_ratings.dat",
+def load_jester2(path="../data/jester2/jester_ratings.dat",
                  test_fraction=0.2, seed=0):
     user_map, item_map, reviews = {}, {}, []
     with open(path, 'r') as f:

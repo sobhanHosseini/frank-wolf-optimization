@@ -15,8 +15,8 @@ from solvers import (
 # Configuration
 # ----------------------------------------------------------------------------
 config = {
-    'datasets':           ['ml-100k'],
-    'steps':              ['analytic', 'vanilla', 'fixed'],
+    'datasets':           ['jester2'],
+    'steps':              ['analytic'],
     'test_fraction':      0.2,
     'seed':               42,
     'tau_scale':          1.0,
@@ -73,7 +73,6 @@ class ExperimentRunner:
 
             ds_results = {}
 
-            # *** FIXED: use solver_name as key, not dataset ***
             for solver_name, Solver in [('FW', FrankWolfe), ('PFW', PairwiseFrankWolfe)]:
                 solver_map = {}
                 for step in self.cfg['steps']:
@@ -97,22 +96,42 @@ class ExperimentRunner:
                     print(f"Finished {solver_name}-{step} "
                           f"in {duration:.1f}s, iters={n_iters}")
 
-                    # Reconstruct full X_k and compute RMSE
-                    rmse_tr = np.zeros(n_iters)
-                    rmse_te = np.zeros(n_iters)
-                    for i, ws in enumerate(solver.weights_history):
-                        Xk = sum(w * atom.to_matrix()
-                                 for w, atom in zip(ws, solver.atoms))
-                        Xk_full = Xk + mu_tr
-                        rmse_tr[i] = evaluate(M_true, Xk_full, mask_train)
-                        rmse_te[i] = evaluate(M_true, Xk_full, mask_test)
+                    # -------------------------------------------------
+                    # Fast vectorized RMSE on observed entries
+                    # -------------------------------------------------
+                    # 1) extract positions and centered targets
+                    rows_tr, cols_tr = np.where(mask_train)
+                    rows_te, cols_te = np.where(mask_test)
+                    y_tr = M_true[rows_tr, cols_tr] - mu_tr
+                    y_te = M_true[rows_te, cols_te] - mu_tr
 
+                    # 2) stack atoms
+                    R_final = len(solver.atoms)
+                    U = np.vstack([atom.u.ravel() for atom in solver.atoms])   # (R_final, m)
+                    V = np.vstack([atom.v.ravel() for atom in solver.atoms])   # (R_final, n)
+                    T = np.array([atom.tau for atom in solver.atoms])[:, None] # (R_final,1)
+
+                    # 3) per-atom predictions on observed entries
+                    A_tr = -T * (U[:, rows_tr] * V[:, cols_tr])  # (R_final, N_tr)
+                    A_te = -T * (U[:, rows_te] * V[:, cols_te])  # (R_final, N_te)
+
+                    # 4) build weight matrix with padding
+                    W = np.zeros((n_iters, R_final))             # (iters, R_final)
+                    for i, ws in enumerate(solver.weights_history):
+                        W[i, :len(ws)] = ws
+
+                    P_tr = W @ A_tr                              # (iters, N_tr)
+                    P_te = W @ A_te                              # (iters, N_te)
+
+                    rmse_tr = np.sqrt(((P_tr - y_tr[None, :])**2).mean(axis=1))
+                    rmse_te = np.sqrt(((P_te - y_te[None, :])**2).mean(axis=1))
+
+                    # other diagnostics
                     gaps     = np.array([h[1] for h in solver.history])
                     obj_vals = np.array([h[2] for h in solver.history])
                     times    = np.array(solver.times[1:n_iters+1])
                     steps_h  = np.array(solver.step_history)[:n_iters]
-                    active_sz= np.array([len(ws) 
-                                         for ws in solver.weights_history])
+                    active_sz= np.array([len(ws) for ws in solver.weights_history])
 
                     solver_map[step] = {
                         'snap_iters':   np.arange(1, n_iters+1),
@@ -125,7 +144,7 @@ class ExperimentRunner:
                         'active_sizes': active_sz,
                     }
 
-                    # summary metrics
+                    # summary
                     final_tr, final_te = rmse_tr[-1], rmse_te[-1]
                     nrm_tr = final_tr / rating_range
                     nrm_te = final_te / rating_range
@@ -139,7 +158,7 @@ class ExperimentRunner:
                          n_iters)
                     )
 
-                ds_results[solver_name] = solver_map   # ← correct key here
+                ds_results[solver_name] = solver_map
 
             self.results[dataset] = ds_results
 
