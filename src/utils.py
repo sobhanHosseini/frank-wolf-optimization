@@ -29,7 +29,7 @@ def train_test_split_matrix(M_true: np.ndarray, test_fraction: float = 0.2,
     M_obs    = sparse.csr_matrix((data, (obs_rows, obs_cols)), shape=M_true.shape)
     return M_obs, mask_train, mask_test, M_true
 
-def load_jester2(path="../data/jester2/jester_ratings.dat",
+def load_jester2(path="./data/jester2/jester_ratings.dat",
                  test_fraction=0.2, seed=0):
     user_map, item_map, reviews = {}, {}, []
     with open(path, 'r') as f:
@@ -44,7 +44,7 @@ def load_jester2(path="../data/jester2/jester_ratings.dat",
         M_true[user_map[u], item_map[i]] = r
     return train_test_split_matrix(M_true, test_fraction, seed)
 
-def load_movielens100k(path="../data/ml-100k/u.data",
+def load_movielens100k(path="./data/ml-100k/u.data",
                        test_fraction=0.2, seed=0):
     df = pd.read_csv(path, sep="\t", names=["user","item","rating","ts"])
     n_u, n_i = df.user.max(), df.item.max()
@@ -53,7 +53,7 @@ def load_movielens100k(path="../data/ml-100k/u.data",
         M_true[u-1, i-1] = r
     return train_test_split_matrix(M_true, test_fraction, seed)
 
-def load_movielens1m(path="../data/ml-1m/ratings.dat",
+def load_movielens1m(path="./data/ml-1m/ratings.dat",
                      test_fraction=0.2, seed=0):
     df = pd.read_csv(path, sep="::", engine="python",
                      names=["user","item","rating","_"])
