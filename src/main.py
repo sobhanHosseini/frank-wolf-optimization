@@ -104,23 +104,6 @@ def plot_time_breakdown(summary_rows):
         plt.legend(); plt.tight_layout()
         _save_or_show(f"{ds}_time_breakdown.png")
 
-# Heatmap of final test RMSE
-def plot_heatmap(summary_rows):
-    import pandas as pd
-    df = pd.DataFrame(summary_rows,
-                      columns=[ 'dataset','method','rmse_tr','rmse_te',
-                                'nrm_tr','nrm_te','r2_tr','r2_te',
-                                'iters','t_solve','t_eval'])
-    pivot = df.pivot(index='dataset', columns='method', values='rmse_te')
-    plt.figure(figsize=(8,3))
-    im = plt.imshow(pivot, aspect='auto', cmap='viridis')
-    plt.xticks(np.arange(pivot.shape[1]), pivot.columns, rotation=45, ha='right')
-    plt.yticks(np.arange(pivot.shape[0]), pivot.index)
-    plt.colorbar(im, label='Test RMSE')
-    plt.title('Final Test RMSE Heatmap')
-    plt.tight_layout()
-    _save_or_show('heatmap_rmse.png')
-
 # ----------------------------------------------------------------------------
 # Experiment Runner
 # ----------------------------------------------------------------------------
@@ -270,5 +253,3 @@ if __name__ == '__main__':
     for ds in config['datasets']:
         plot_convergence(results, ds)
     plot_time_breakdown(summary_rows)
-    # plot_heatmap(summary_rows)
-    # plot_performance_scatter(summary_rows)
