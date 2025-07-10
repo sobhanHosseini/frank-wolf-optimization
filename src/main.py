@@ -15,13 +15,13 @@ from solvers import (
 # Configuration
 # ----------------------------------------------------------------------------
 config = {
-    'datasets':           ['ml-100k', 'jester2','ml-1m'],
+    'datasets':           ['ml-100k'],
     'steps':              ['analytic', 'vanilla'],
     'test_fraction':      0.2,
     'seed':               42,
     'tau_scale':          1.0,
-    'max_iter':           100,
-    'tol':                5e-2,
+    'max_iter':           200,
+    'tol':                1e-1,
     'snapshot_interval':  5,
     'tau_approx_k':       12,
     'fixed_step':         0.1,
@@ -181,14 +181,40 @@ class ExperimentRunner:
                     A_tr = -T * (U[:, rows_tr] * V[:, cols_tr])
                     A_te = -T * (U[:, rows_te] * V[:, cols_te])
 
-                    # build weight matrix
-                    W = np.zeros((iters, R))
+
+
+                    # 1) Build W from your history
+                    iters = len(solver.weights_history)
+                    R_max = max(len(ws) for ws in solver.weights_history)
+                    W = np.zeros((iters, R_max))
                     for i, ws in enumerate(solver.weights_history):
                         W[i, :len(ws)] = ws
-
+                
+                    # 2) Stack your final atoms
+                    U = np.vstack([a.u.ravel() for a in solver.atoms])    # (R_final, m*n)
+                    V = np.vstack([a.v.ravel() for a in solver.atoms])    # (R_final, m*n)
+                    T = np.array([a.tau for a in solver.atoms])[:, None]  # (R_final, 1)
+                
+                    # 3) Build A_tr, A_te from them
+                    A_tr = -T * (U[:, rows_tr] * V[:, cols_tr])
+                    A_te = -T * (U[:, rows_te] * V[:, cols_te])
+                
+                    # 4) **Auto-align dimensions**: pad whichever side is smaller
+                    nW, nA = W.shape[1], A_tr.shape[0]
+                    if nW < nA:
+                        # Weight matrix too skinny → pad W with zero-cols
+                        pad = nA - nW
+                        W = np.hstack([W, np.zeros((iters, pad))])
+                    elif nA < nW:
+                        # Atom matrices too short → pad A_tr/A_te with zero-rows
+                        pad = nW - nA
+                        A_tr = np.vstack([A_tr, np.zeros((pad, A_tr.shape[1]))])
+                        A_te = np.vstack([A_te, np.zeros((pad, A_te.shape[1]))])
+                
+                    # 5) Now shapes line up: (iters × R) @ (R × n_obs)
                     t1 = time.time()
-                    rmse_tr = np.sqrt(((W @ A_tr - y_tr[None,:])**2).mean(axis=1))
-                    rmse_te = np.sqrt(((W @ A_te - y_te[None,:])**2).mean(axis=1))
+                    rmse_tr = np.sqrt(((W @ A_tr - y_tr[None, :])**2).mean(axis=1))
+                    rmse_te = np.sqrt(((W @ A_te - y_te[None, :])**2).mean(axis=1))
                     t_eval = time.time() - t1
                     print(f"RMSE eval: {t_eval:.2f}s")
 
