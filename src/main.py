@@ -15,7 +15,7 @@ from solvers import (
 # Configuration
 # ----------------------------------------------------------------------------
 config = {
-    'datasets':           ['ml-100k'],
+    'datasets':           ['ml-100k'], # ml-100k - jester2 - ml-1m
     'steps':              ['analytic', 'vanilla'],
     'test_fraction':      0.2,
     'seed':               42,
